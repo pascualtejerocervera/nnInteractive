@@ -1,8 +1,8 @@
 [project]
-name = "nnInteractive"
+name = "nnInteractive_v1"
 version = "1.1.5"
 requires-python = ">=3.10"
-description = "Inference code for nnInteractive"
+description = "Inference code for nnInteractive_v1"
 readme = "readme.md"
 license = { file = "LICENSE" }
 authors = [
@@ -57,4 +57,4 @@ skip = '.git,*.pdf,*.svg'
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["nnInteractive*"]
+include = ["nnInteractive_v1*"]

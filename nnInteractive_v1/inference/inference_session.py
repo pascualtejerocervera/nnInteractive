@@ -15,14 +15,14 @@ from torch import nn
 from torch._dynamo import OptimizedModule
 from torch.nn.functional import interpolate
 
-import nnInteractive
-from nnInteractive.interaction.point import PointInteraction_stub
-from nnInteractive.trainer.nnInteractiveTrainer import nnInteractiveTrainer_stub
-from nnInteractive.utils.bboxes import generate_bounding_boxes
-from nnInteractive.utils.crop import crop_and_pad_into_buffer, paste_tensor, pad_cropped, crop_to_valid
-from nnInteractive.utils.erosion_dilation import iterative_3x3_same_padding_pool3d
-from nnInteractive.utils.os_shennanigans import is_linux_kernel_6_11
-from nnInteractive.utils.rounding import round_to_nearest_odd
+import nnInteractive_v1
+from nnInteractive_v1.interaction.point import PointInteraction_stub
+from nnInteractive_v1.trainer.nnInteractiveTrainer import nnInteractiveTrainer_stub
+from nnInteractive_v1.utils.bboxes import generate_bounding_boxes
+from nnInteractive_v1.utils.crop import crop_and_pad_into_buffer, paste_tensor, pad_cropped, crop_to_valid
+from nnInteractive_v1.utils.erosion_dilation import iterative_3x3_same_padding_pool3d
+from nnInteractive_v1.utils.os_shennanigans import is_linux_kernel_6_11
+from nnInteractive_v1.utils.rounding import round_to_nearest_odd
 
 
 class nnInteractiveInferenceSession():
@@ -738,7 +738,7 @@ class nnInteractiveInferenceSession():
         configuration_manager = plans_manager.get_configuration(configuration_name)
         # restore network
         num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
-        trainer_class = recursive_find_python_class(join(nnInteractive.__path__[0], "trainer"),
+        trainer_class = recursive_find_python_class(join(nnInteractive_v1.__path__[0], "trainer"),
                                                     trainer_name, 'nnInteractive.trainer')
         if trainer_class is None:
             print(f'Unable to locate trainer class {trainer_name} in nnInteractive.trainer. '
