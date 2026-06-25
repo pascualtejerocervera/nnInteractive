@@ -739,9 +739,9 @@ class nnInteractiveInferenceSession():
         # restore network
         num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
         trainer_class = recursive_find_python_class(join(nnInteractive_v1.__path__[0], "trainer"),
-                                                    trainer_name, 'nnInteractive.trainer')
+                                                    trainer_name, 'nnInteractive_v1.trainer')
         if trainer_class is None:
-            print(f'Unable to locate trainer class {trainer_name} in nnInteractive.trainer. '
+            print(f'Unable to locate trainer class {trainer_name} in nnInteractive_v1.trainer. '
                                f'Please place it there (in any .py file)!')
             print('Attempting to use default nnInteractiveTrainer_stub. If you encounter errors, this is where you need to look!')
             trainer_class = nnInteractiveTrainer_stub
