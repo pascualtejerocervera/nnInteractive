@@ -36,11 +36,11 @@ from nnInteractive_v2.utils.rounding import round_to_nearest_odd
 
 
 class nnInteractiveInferenceSession:
-    # The session version IS the installed nnInteractive package version (used for
-    # checkpoint compatibility checks and reported to remote clients). `nnInteractive`
+    # The session version IS the installed nnInteractive_v2 package version (used for
+    # checkpoint compatibility checks and reported to remote clients). `nnInteractive_v2`
     # is a PEP 420 namespace package (no __init__ to carry __version__), so read it
     # from the distribution metadata instead.
-    INFERENCE_SESSION_VERSION = _package_version("nnInteractive")
+    INFERENCE_SESSION_VERSION = _package_version("nnInteractive_v2")
     # Single-level undo of the last interaction is always available (see undo()).
     supports_undo: bool = True
     REFINEMENT_CACHE_GPU_HEADROOM_BYTES = 4 * 1024**3
