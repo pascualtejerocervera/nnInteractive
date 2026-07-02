@@ -1421,10 +1421,12 @@ class nnInteractiveInferenceSession:
 
                 refinement_bboxes = self._plan_refinement_bboxes(pred, scaled_bbox, force_full_refine)
 
-                # Place the coarse segmentation into prev_seg before refinement
-                paste_tensor(self.interactions, pred, scaled_bbox, channel_idx=prev_seg_channel)
-
-                self._refine_coarse(refinement_bboxes)
+                # NOTE: we deliberately do NOT write the coarse prediction into self.interactions here.
+                # The refinement network needs the coarse segmentation as prev_seg *input context*, but that
+                # context must stay confined to the local refinement cache (see _refine_coarse_with_local_cache).
+                # Committing it to the persistent prev_seg channel would leave coarse data in the gaps between
+                # refinement bboxes, poisoning the next prompt and (formerly) leaking into the target buffer.
+                self._refine_coarse(refinement_bboxes, pred, scaled_bbox)
 
         print(f"Done. Total time {round(time() - start_predict, 3)}s")
 
@@ -1510,21 +1512,54 @@ class nnInteractiveInferenceSession:
         empty_cache(self.device)
         return input_for_predict, scaled_patch_size, scaled_bbox, previous_prediction
 
-    def _refine_coarse(self, bboxes_ordered: List[List[List[int]]]):
+    def _refine_coarse(
+        self, bboxes_ordered: List[List[List[int]]], coarse_pred: torch.Tensor, coarse_bbox: List[List[int]]
+    ):
         start_refinement = time()
         prev_seg_channel = self._get_prev_seg_channel()
 
         if self.verbose:
             print(f"Using {len(bboxes_ordered)} bounding boxes for refinement")
 
-        self._refine_coarse_with_local_cache(bboxes_ordered, prev_seg_channel)
+        self._refine_coarse_with_local_cache(bboxes_ordered, prev_seg_channel, coarse_pred, coarse_bbox)
         end_refinement = time()
         print(
             f"Took {round(end_refinement - start_refinement, 3)} s for refining the segmentation with {len(bboxes_ordered)} bounding boxes"
         )
 
-    def _refine_coarse_with_local_cache(self, bboxes_ordered: List[List[List[int]]], prev_seg_channel: int) -> None:
+    def _refine_coarse_with_local_cache(
+        self,
+        bboxes_ordered: List[List[List[int]]],
+        prev_seg_channel: int,
+        coarse_pred: torch.Tensor,
+        coarse_bbox: List[List[int]],
+    ) -> None:
+        # The cache is cropped out of the *uncontaminated* self.interactions, so its prev_seg channel starts
+        # as the previous refined segmentation.
         cache_bbox, cache_image, cache_interactions = self._build_refinement_local_cache(bboxes_ordered)
+
+        # Inject the coarse prediction into the cache's prev_seg channel ONLY. This gives the refinement
+        # network the coarse context it needs to sharpen, but the coarse data lives exactly as long as the
+        # cache does -- it never reaches the persistent prev_seg channel or the target buffer.
+        #
+        # Restrict the injection to the in-image region. cache_bbox can extend past the image edge (refinement
+        # bboxes are not clipped to image bounds), and those out-of-image cache voxels are zero-padding that a
+        # border refinement patch also sees. Feeding coarse foreground into that padding would change the
+        # refined border vs. how the coarse pass itself was fed (prev_seg is 0-padded in _build_network_input),
+        # so we clip coarse_bbox to the image and slice coarse_pred to match, leaving out-of-image voxels at 0.
+        spatial_shape = tuple(int(i) for i in self.interactions.shape[1:])
+        inject_bbox = self._clip_bbox_to_shape(coarse_bbox, spatial_shape)
+        if inject_bbox is not None:
+            pred_slicer = tuple(slice(lb - c0, ub - c0) for (lb, ub), (c0, _) in zip(inject_bbox, coarse_bbox))
+            inject_local_bbox = [
+                [lb - cache_dim[0], ub - cache_dim[0]] for (lb, ub), cache_dim in zip(inject_bbox, cache_bbox)
+            ]
+            paste_tensor(
+                cache_interactions,
+                coarse_pred[pred_slicer].to(cache_interactions.device, dtype=cache_interactions.dtype),
+                inject_local_bbox,
+                channel_idx=prev_seg_channel,
+            )
 
         for refinement_bbox in bboxes_ordered:
             local_bbox = [
@@ -1555,9 +1590,26 @@ class nnInteractiveInferenceSession:
             del image_patch, interactions_patch, patch
             del pred
 
+        # Commit ONLY the refined bboxes into the persistent prev_seg channel and the target buffer. The gaps
+        # of the rectangular union hull (cache_bbox) still hold coarse data in the cache, so pasting the whole
+        # hull -- as we used to -- would leak that coarse prediction into both the persistent state (poisoning
+        # the next prompt) and the target buffer (which then "appears coarse"). Writing each refined bbox
+        # individually keeps every un-refined voxel at its previous full-resolution value; the coarse cache is
+        # discarded below.
         final_prev_seg = cache_interactions[prev_seg_channel]
-        paste_tensor(self.interactions, final_prev_seg, cache_bbox, channel_idx=prev_seg_channel)
-        self._paste_prediction_to_target_buffer(final_prev_seg, cache_bbox)
+        for refinement_bbox in bboxes_ordered:
+            local_bbox = [
+                [lb - cache_dim[0], ub - cache_dim[0]] for (lb, ub), cache_dim in zip(refinement_bbox, cache_bbox)
+            ]
+            local_slicer = tuple(slice(lb, ub) for lb, ub in local_bbox)
+            refined_patch = final_prev_seg[local_slicer]
+            paste_tensor(self.interactions, refined_patch, refinement_bbox, channel_idx=prev_seg_channel)
+            self._paste_prediction_to_target_buffer(refined_patch, refinement_bbox)
+
+        # Report the full refined ROI (union hull of all bboxes) as the changed region so remote clients copy
+        # every potentially-updated voxel in one shot; the per-bbox pastes above each left _last_paste_bbox at
+        # their own (smaller) box.
+        self._last_paste_bbox = cache_bbox
 
         del cache_image, cache_interactions, final_prev_seg
         empty_cache(self.device)

@@ -46,6 +46,12 @@ homepage = "https://github.com/MIC-DKFZ/nnInteractive"
 requires = ["setuptools>=67.8.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.black]
+# Keep in sync with .pre-commit-config.yaml and the root pyproject.toml (black runs with --line-length 120).
+# The client is a separate distribution with its own project root, so black discovers config from THIS file
+# when formatting client/; without it a bare `black client/` falls back to black's default 88 and reformats.
+line-length = 120
+
 # The client provides only the `nnInteractive.inference.remote` subtree. The two
 # parent packages (`nnInteractive`, `nnInteractive.inference`) are PEP 420
 # namespace packages shared with the full distribution, so neither ships an
