@@ -1,6 +1,6 @@
 """Client-side stand-in for nnInteractiveInferenceSession backed by an HTTP server.
 
-Public API matches the local session (see nnInteractive/inference/inference_session.py
+Public API matches the local session (see nnInteractive_v2/inference/inference_session.py
 and API_CHANGES_v2.md). All model state lives on the server; this object holds
 only the user's target_buffer (mirrored from server responses) and the
 capability metadata fetched at construction time.
@@ -26,7 +26,7 @@ except ImportError:
     # uses a torch.Tensor target buffer; numpy buffers work without it.
     torch = None
 
-from nnInteractive.inference.remote._protocol import (
+from nnInteractive_v2.inference.remote._protocol import (
     CONTENT_TYPE_OCTET_STREAM,
     LEASE_HEADER,
     META_HEADER,
@@ -47,7 +47,7 @@ from nnInteractive.inference.remote._protocol import (
     PATH_SET_TARGET_BUFFER,
     PATH_UNDO,
 )
-from nnInteractive.inference.remote.serialization import pack_array, unpack_array
+from nnInteractive_v2.inference.remote.serialization import pack_array, unpack_array
 
 
 def _compression_threads() -> int:

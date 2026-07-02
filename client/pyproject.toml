@@ -1,8 +1,8 @@
 [project]
-name = "nninteractive-client"
+name = "nninteractive_v2-client"
 version = "2.5.0"
 requires-python = ">=3.10"
-description = "Lightweight, torch-free remote client for nnInteractive (nnInteractiveRemoteInferenceSession)"
+description = "Lightweight, torch-free remote client for nnInteractive_v2 (nnInteractive_v2RemoteInferenceSession)"
 readme = "readme.md"
 license = { file = "LICENSE" }
 authors = [
@@ -22,10 +22,10 @@ classifiers = [
 ]
 keywords = [
     'medical image segmentation',
-    'nnInteractive',
+    'nnInteractive_v2',
     'remote inference client',
 ]
-# Wire-only dependency set: enough to drive a remote nninteractive-server, with
+# Wire-only dependency set: enough to drive a remote nnInteractive_v2-server, with
 # no torch / nnU-Net. This is the whole point of the lightweight client — it can
 # be installed into a host that has its own torch policy (e.g. 3D Slicer) or onto
 # a thin client machine with no GPU.
@@ -52,5 +52,5 @@ build-backend = "setuptools.build_meta"
 # __init__.py — that is why namespace discovery is required here.
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["nnInteractive*"]
+include = ["nnInteractive_v2*"]
 namespaces = true

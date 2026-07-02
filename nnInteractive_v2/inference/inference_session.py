@@ -21,18 +21,18 @@ from torch import nn
 from torch._dynamo import OptimizedModule
 from torch.nn.functional import interpolate
 
-from nnInteractive.interaction.point import PointInteraction_stub
-from nnInteractive.trainer.nnInteractiveTrainer import nnInteractiveTrainer_stub
-from nnInteractive.utils.bboxes import generate_bounding_boxes
-from nnInteractive.utils.crop import crop_and_pad_into_buffer, paste_tensor, pad_cropped, crop_to_valid
-from nnInteractive.utils.erosion_dilation import iterative_3x3_same_padding_pool3d
-from nnInteractive.utils.inference_helpers import (
+from nnInteractive_v2.interaction.point import PointInteraction_stub
+from nnInteractive_v2.trainer.nnInteractiveTrainer import nnInteractiveTrainer_stub
+from nnInteractive_v2.utils.bboxes import generate_bounding_boxes
+from nnInteractive_v2.utils.crop import crop_and_pad_into_buffer, paste_tensor, pad_cropped, crop_to_valid
+from nnInteractive_v2.utils.erosion_dilation import iterative_3x3_same_padding_pool3d
+from nnInteractive_v2.utils.inference_helpers import (
     infer_num_interaction_channels_from_mapping,
     parse_channel_pair,
     version_to_tuple,
 )
-from nnInteractive.utils.os_shennanigans import is_linux_kernel_6_11
-from nnInteractive.utils.rounding import round_to_nearest_odd
+from nnInteractive_v2.utils.os_shennanigans import is_linux_kernel_6_11
+from nnInteractive_v2.utils.rounding import round_to_nearest_odd
 
 
 class nnInteractiveInferenceSession:
@@ -1806,10 +1806,10 @@ class nnInteractiveInferenceSession:
         # namespace package, so `nnInteractive.__path__[0]` is order-dependent and may point at the
         # client distribution's portion (which has no trainer/); `nnInteractive.trainer` is a real
         # subpackage with a single, unambiguous path.
-        import nnInteractive.trainer
+        import nnInteractive_v2.trainer
 
         trainer_class = recursive_find_python_class(
-            nnInteractive.trainer.__path__[0], trainer_name, "nnInteractive.trainer"
+            nnInteractive_v2.trainer.__path__[0], trainer_name, "nnInteractive_v2.trainer"
         )
         if trainer_class is None:
             # fall back to looking for the trainer in nnunetv2
@@ -1822,11 +1822,11 @@ class nnInteractiveInferenceSession:
             )
         if trainer_class is None:
             print(
-                f"Unable to locate trainer class {trainer_name} in nnInteractive.trainer. "
+                f"Unable to locate trainer class {trainer_name} in nnInteractive_v2.trainer. "
                 f"Please place it there (in any .py file)!"
             )
             print(
-                "Attempting to use default nnInteractiveTrainer_stub. If you encounter errors, this is where you need to look!"
+                "Attempting to use default nnInteractive_v2Trainer_stub. If you encounter errors, this is where you need to look!"
             )
             trainer_class = nnInteractiveTrainer_stub
 

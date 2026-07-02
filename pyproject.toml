@@ -1,8 +1,8 @@
 [project]
-name = "nnInteractive"
+name = "nnInteractive_v2"
 version = "2.5.0"
 requires-python = ">=3.10"
-description = "Inference code for nnInteractive"
+description = "Inference code for nnInteractive_v2"
 readme = "readme.md"
 license = { file = "LICENSE" }
 authors = [
@@ -62,9 +62,9 @@ dev = [
 ]
 
 [project.scripts]
-nninteractive-server = "nnInteractive.inference.server.main:main"
-nninteractive-available-models = "nnInteractive.model_management:available_models_cli"
-nninteractive-download-model = "nnInteractive.model_management:download_model_cli"
+nninteractive-server = "nnInteractive_v2.inference.server.main:main"
+nninteractive-available-models = "nnInteractive_v2.model_management:available_models_cli"
+nninteractive-download-model = "nnInteractive_v2.model_management:download_model_cli"
 
 [build-system]
 requires = ["setuptools>=67.8.0"]
@@ -77,10 +77,10 @@ skip = '.git,*.pdf,*.svg'
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["nnInteractive*"]
-# `nnInteractive` and `nnInteractive.inference` are PEP 420 namespace packages
-# (no __init__.py) shared with the nninteractive-client distribution, so namespace
+include = ["nnInteractive_v2*"]
+# `nnInteractive_v2` and `nnInteractive_v2.inference` are PEP 420 namespace packages
+# (no __init__.py) shared with the nnInteractive_v2-client distribution, so namespace
 # discovery is required. Exclude the client-owned remote subtree (shipped by
-# nninteractive-client) and the separately-packaged supervoxel module.
+# nnInteractive_v2-client) and the separately-packaged supervoxel module.
 namespaces = true
-exclude = ["nnInteractive.inference.remote*", "nnInteractive.supervoxel*"]
+exclude = ["nnInteractive_v2.inference.remote*", "nnInteractive_v2.supervoxel*"]
