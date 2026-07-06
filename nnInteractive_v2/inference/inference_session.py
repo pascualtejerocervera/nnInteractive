@@ -809,7 +809,10 @@ class nnInteractiveInferenceSession:
     @torch.inference_mode()
     def _background_set_image(self, image: np.ndarray, image_properties: dict):
         # Convert and clone the image tensor.
-        image = torch.from_numpy(image.copy()).float()
+        # image = torch.from_numpy(image.copy()).float()
+        image = torch.from_numpy(image)
+        if image.dtype != torch.float32:
+            image = image.to(torch.float32, copy=False)
 
         # The image is intentionally NOT cropped: interactions, predictions and the target buffer all
         # live in the original image's coordinate space (so the previously unreachable zero-valued border
@@ -901,27 +904,33 @@ class nnInteractiveInferenceSession:
         the compression machinery. The caller guarantees no mutation happens while this runs
         (the next interaction blocks on _commit_pending_snapshot; _predict drains first).
         """
-        cparams = self._blosc2_cparams()
-        if isinstance(self.interactions, torch.Tensor):
-            # .numpy() is a zero-copy view of the (contiguous, possibly pinned) buffer; asarray reads
-            # it directly while compressing, so there is no extra host-side memcopy. blosc2 picks
-            # sensible chunks/blocks for the (C, X, Y, Z) shape and infers typesize from the dtype.
-            interactions = blosc2.asarray(self.interactions.numpy(), cparams=cparams, dparams={"nthreads": 1})
-        else:
-            interactions = self.interactions.copy()
+        # cparams = self._blosc2_cparams()
+        # if isinstance(self.interactions, torch.Tensor):
+        #     # .numpy() is a zero-copy view of the (contiguous, possibly pinned) buffer; asarray reads
+        #     # it directly while compressing, so there is no extra host-side memcopy. blosc2 picks
+        #     # sensible chunks/blocks for the (C, X, Y, Z) shape and infers typesize from the dtype.
+        #     interactions = blosc2.asarray(self.interactions.numpy(), cparams=cparams, dparams={"nthreads": 1})
+        # else:
+        #     interactions = self.interactions.copy()
 
-        target = None
-        if self.target_buffer is not None:
-            t_np = (
-                self.target_buffer
-                if isinstance(self.target_buffer, np.ndarray)
-                else self.target_buffer.detach().cpu().numpy()
-            )
-            target = blosc2.asarray(np.ascontiguousarray(t_np), cparams=cparams, dparams={"nthreads": 1})
+        # target = None
+        # if self.target_buffer is not None:
+        #     t_np = (
+        #         self.target_buffer
+        #         if isinstance(self.target_buffer, np.ndarray)
+        #         else self.target_buffer.detach().cpu().numpy()
+        #     )
+        #     target = blosc2.asarray(np.ascontiguousarray(t_np), cparams=cparams, dparams={"nthreads": 1})
 
+        # return {
+        #     "interactions": interactions,
+        #     "target": target,
+        #     "current_interaction_intensity": self.current_interaction_intensity,
+        #     "last_paste_bbox": self._copy_bbox(self._last_paste_bbox),
+        # }
         return {
-            "interactions": interactions,
-            "target": target,
+            "interactions": None,
+            "target": None,
             "current_interaction_intensity": self.current_interaction_intensity,
             "last_paste_bbox": self._copy_bbox(self._last_paste_bbox),
         }
