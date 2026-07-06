@@ -154,7 +154,10 @@ class nnInteractiveInferenceSession():
 
     def _background_set_image(self, image: np.ndarray, image_properties: dict):
         # Convert and clone the image tensor.
-        image = torch.from_numpy(image.copy())#.to(self.device)
+        # image = torch.from_numpy(image.copy())#.to(self.device)
+        image = torch.from_numpy(image)
+        if image.dtype != torch.float32:
+            image = image.to(torch.float32, copy=False)
 
         # Crop to nonzero region.
         if self.verbose:
@@ -164,7 +167,7 @@ class nnInteractiveInferenceSession():
         bbox = [[i.min().item(), i.max().item() + 1] for i in nonzero_idx]
         del nonzero_idx
         slicer = bounding_box_to_slice(bbox)  # Assuming this returns a tuple of slices.
-        image = image[slicer].float()
+        image = image[slicer]#.float()
         if self.verbose:
             print(f'Cropped image shape: {image.shape}')
 
