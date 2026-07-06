@@ -76,6 +76,7 @@ from nnInteractive.inference.remote._protocol import (
     PATH_HEALTHZ,
     PATH_HEARTBEAT,
     PATH_LEASE_STATUS,
+    PATH_PREDICT,
     PATH_RELEASE,
     PATH_RESET_INTERACTIONS,
     PATH_SET_DO_AUTOZOOM,
@@ -643,6 +644,18 @@ def make_app(
             return _build_prediction_response(session, ran_prediction=ran)
 
         return _under_session_lock(entry, _do)
+
+    @app.post(PATH_PREDICT, dependencies=[auth])
+    def predict(payload: dict, entry: SessionEntry = lease) -> Response:
+        # Run prediction on the interactions accumulated so far (added with
+        # run_prediction=False). Returns nothing changed when nothing is queued.
+        force_full_refine = bool(payload.get("force_full_refine", False))
+
+        def _do(session):
+            bbox = session._predict(force_full_refine=force_full_refine)
+            return _build_prediction_response(session, ran_prediction=bbox is not None)
+
+        return _under_session_and_gpu_lock(entry, _do)
 
     @app.post(PATH_ADD_BBOX, dependencies=[auth])
     def add_bbox_interaction(payload: dict, entry: SessionEntry = lease) -> Response:

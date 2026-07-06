@@ -40,6 +40,7 @@ from nnInteractive.inference.remote._protocol import (
     PATH_HEALTHZ,
     PATH_HEARTBEAT,
     PATH_LEASE_STATUS,
+    PATH_PREDICT,
     PATH_RELEASE,
     PATH_RESET_INTERACTIONS,
     PATH_SET_DO_AUTOZOOM,
@@ -388,6 +389,17 @@ class nnInteractiveRemoteInferenceSession:
         nothing to undo (mirrors the local session's undo())."""
         resp = self._post_json(PATH_UNDO, {})
         return self._apply_prediction_response(resp)
+
+    def _predict(self, force_full_refine: bool = False) -> Optional[List[List[int]]]:
+        """Run prediction on the accumulated interactions without adding a new one.
+
+        Mirrors the local session's ``_predict`` so callers can trigger a manual
+        prediction (e.g. after adding prompts with ``run_prediction=False``). Patches
+        the local target buffer with the changed region and returns its bbox, or
+        None when nothing was queued to predict."""
+        resp = self._post_json(PATH_PREDICT, {"force_full_refine": bool(force_full_refine)})
+        ran = self._apply_prediction_response(resp)
+        return self._last_paste_bbox if ran else None
 
     def add_bbox_interaction(
         self,
