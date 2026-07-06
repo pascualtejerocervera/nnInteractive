@@ -70,6 +70,12 @@ nninteractive-download-model = "nnInteractive_v2.model_management:download_model
 requires = ["setuptools>=67.8.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.black]
+# Keep in sync with .pre-commit-config.yaml (black is run there with --line-length 120).
+# Without this, a bare `black nnInteractive/` uses black's default line length (88) and would
+# reformat the whole codebase.
+line-length = 120
+
 [tool.codespell]
 skip = '.git,*.pdf,*.svg'
 #

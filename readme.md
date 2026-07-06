@@ -32,6 +32,8 @@ Huge thanks to the community for contributing these integrations!
 
 ## 📰 News
 
+- **06/2026**: 🐳 The inference server now ships as a **Docker image** — run nnInteractive on a GPU box with a single `docker run`, no install required. See [`DOCKER.md`](nnInteractive/inference/server/DOCKER.md)
+- **05/2026**: 🌐 **Remote GPU inference** (client/server): drive nnInteractive over HTTP from a machine without a GPU via `nnInteractiveRemoteInferenceSession`, with one server hosting multiple concurrent sessions. See [`SERVER_CLIENT.md`](SERVER_CLIENT.md)
 - **11/2025**: 🌐 New community driven **OHIF integration** released by our colleagues at [CCI Bonn](https://ccibonn.ai/). Try nnInteractive directly in OHIF 👉 [OHIF-AI](https://github.com/CCI-Bonn/OHIF-AI)
 - **07/2025**: 🧩 New ITK-SNAP extension released! Try nnInteractive directly in ITK-SNAP 👉 [Quick Start](https://itksnap-dls.readthedocs.io/en/latest/quick_start.html)
 - **06/2025**: 🏆 We’re thrilled to announce that `nnInteractive` **won the 1st place** in the [CVPR 2025 Challenge on Interactive 3D Segmentation](https://www.codabench.org/competitions/5263/). Huge shoutout to the organizers and all contributors!
@@ -75,7 +77,7 @@ nnInteractive ships as **two pip packages — install only what you need:**
 - **`nninteractive-client`** — lightweight remote client that drives a remote
   `nninteractive-server` (via `nnInteractiveRemoteInferenceSession`). **No PyTorch, no GPU** —
   only `numpy` / `httpx` / `blosc2`. Ideal for a GUI or thin client.
-- **`nnInteractive`** — the full stack: the in-process inference engine *and* the official
+- **`nnInteractive`** — the full stack: the local inference engine *and* the official
   server. Needs **PyTorch and an NVIDIA GPU** (10 GB VRAM recommended; small objects work with
   \<6 GB). It depends on `nninteractive-client`, so it includes the remote client too.
 
@@ -371,6 +373,24 @@ multi-user deployment behind a reverse proxy, concurrency/session model, idle
 expiry and heartbeats, GUI integration notes, and troubleshooting — see
 [`SERVER_CLIENT.md`](SERVER_CLIENT.md).
 
+### Run the server in Docker
+
+Prefer not to install anything? The server is also published as a Docker image
+on the GitHub Container Registry. The default image has the model **baked in**,
+so it runs with a single command (a GPU host with the NVIDIA Container Toolkit
+is required):
+
+```bash
+docker run --gpus all -p 1527:1527 \
+    -e NN_INTERACTIVE_API_KEY="$(openssl rand -hex 32)" \
+    ghcr.io/mic-dkfz/nninteractive-server:latest
+```
+
+A `lite` tag is also available if you'd rather mount your own checkpoint folder
+at `/model` instead of using the baked-in weights. For both flavours,
+configuration options, and how to build the image yourself, see
+[`DOCKER.md`](nnInteractive/inference/server/DOCKER.md).
+
 ## nnInteractive SuperVoxels
 
 As part of the `nnInteractive` framework, we provide a dedicated module for **supervoxel generation** based on [SAM](https://github.com/facebookresearch/segment-anything) and [SAM2](https://github.com/facebookresearch/sam2). This replaces traditional superpixel methods (e.g., SLIC) with **foundation model–powered 3D pseudo-labels**.
@@ -402,6 +422,77 @@ Release model folders ship their own `LICENSE` file whose **first line is the li
 
 # Changelog
 
+<details>
+<summary>Click to expand the full version history</summary>
+
+### 2.5.0 - 2026-06-26
+
+- **Lightweight, torch-free `nninteractive-client` package**: the remote client now ships as its own distribution so GUIs / thin clients can drive a remote server without pulling in torch or nnU-Net. It shares the `nnInteractive` import namespace with the full package; the full package depends on it and pins it in lockstep.
+- **Model discovery / download by id**: official models are enumerated by a Hugging Face manifest (`MIC-DKFZ/nnInteractive`) and downloaded on demand into `$NNINTERACTIVE_MODEL_DIR` (default `~/.nninteractive`). New `nninteractive-available-models` / `nninteractive-download-model` CLI entry points, and the server gained `--model <id>` to serve an official model by name (`--model-dir` is no longer required). Default `--max-sessions` raised from 1 to 3.
+- Predictions and every `add_*_interaction()` call now return the bounding box of the changed region (clipped to the target buffer), so clients that cannot share the buffer can copy only the changed sub-volume.
+- Added a **Docker** build for the server.
+
+### 2.4.2 - 2026-06-23
+
+- Reuse the interactions buffer and pinned-memory buffers for the tensor prompt backend (one fewer memcpy); lowered the blosc2 auto-threshold.
+- Fixed a crash when an image prompt lies entirely outside the cropped region.
+- Disable `torch.compile` on CPU.
+
+### 2.4.0 - 2026-06-19
+
+- Added **undo** support and clearer error messages.
+- Reuse pinned-memory buffers for faster prompt compression; fixed a missing typesize in blosc2 compression.
+- Disable `torch.compile` on Windows (with a warning).
+- Fall back to locating the trainer class in the nnU-Net repo when it is not bundled here.
+
+### 2.3.3 - 2026-06-12
+
+- Choose between torch- and blosc2-backed prompt storage; `auto` (the default) uses a tensor for images smaller than 512×512×1024 and blosc2 otherwise. The blosc2 path is faster thanks to a preallocated output buffer.
+- Heartbeats continue during large image transfers.
+
+### 2.3.1 - 2026-06-03
+
+- The client explicitly sets the number of worker threads.
+
+### 2.3.0 - 2026-06-03
+
+- Expose the model license and print it on init; run the `torch.compile` warmup at init.
+- Validate remote target-buffer requests.
+- Improved blosc2 compression behavior.
+- Added the PyPI publishing workflow.
+
+### 2.2.0 - 2026-05-29
+
+- **`torch.compile` support**, enabled by default for the server and triggered at startup so clients never pay the first-prediction compile cost.
+- The server gained two independent timeouts: a heartbeat liveness check and an inactivity timeout.
+
+### 2.1.0 - 2026-05-28
+
+- **Remote inference server / client** (`nnInteractiveRemoteInferenceSession`): drive nnInteractive over HTTP from a machine without a GPU. One server hosts multiple concurrent client sessions.
+- Large images are chunked during client/server transfer; serialization fixes.
+- Simpler install; fixed a bounding box that could extend beyond the image.
+
+### 2.0.0 - 2026-05-28
+
+- Major inference rework — restructured, more readable code.
+- Compressed (half-precision) interactions are now the only mode; preprocessing runs on the GPU; substantially reduced VRAM for AutoZoom and refinement.
+- New capability / `inference_info.json` format, with bbox sanity and capability checks.
+- Removed the pseudo-lasso path; reformatted the codebase with black.
+
+### 1.1.5 - 2026-04-10
+
+- Compatibility with nnU-Net v2.7.0.
+
+### 1.1.4 - 2026-02-19
+
+- Mask refinement now always covers the entire mask.
+- Added model-license reminders.
+
+### 1.1.3 - 2025-11-28
+
+- Pin `torch < 2.9.0` to avoid a 3D-convolution memory regression.
+- Documentation clarifications (no manual preprocessing in the minimal example).
+
 ### 1.1.2 - 2025-08-02
 
 - Fixed a bug where `pin_memory` was set to `True` even though no CUDA devices were present (this broke CPU support)
@@ -419,6 +510,8 @@ Release model folders ship their own `LICENSE` file whose **first line is the li
   - sometimes caused blocky predictions
   - may cause failure to update segmentation map if changes were minor and AutoZoom was triggered
 - ✅ API compatible with 1.0.1
+
+</details>
 
 ## Acknowledgments
 

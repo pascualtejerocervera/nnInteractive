@@ -98,6 +98,14 @@ class nnInteractiveInferenceSession:
         self.plans_manager = None
         self._interactions_shape = None
         self.device = device
+        if device.type == "cuda":
+            # Every forward pass this session runs has the same fixed input shape
+            # ([1, num_input_channels + num_interaction_channels, *patch_size]; see warmup()),
+            # so cuDNN benchmark mode autotunes the convolution algorithms once on the first
+            # pass and reuses the fastest ones thereafter. For fixed input shapes this is pure
+            # upside; warmup() pays that autotuning cost at startup instead of on the first
+            # real prediction.
+            torch.backends.cudnn.benchmark = True
         if use_torch_compile and sys.platform.startswith("win"):
             # torch.compile relies on triton, which is not available out of the box on Windows.
             warnings.warn(
@@ -1257,40 +1265,54 @@ class nnInteractiveInferenceSession:
             return None
 
     @torch.inference_mode()
-    def warmup(self) -> bool:
-        """Run a single dummy forward pass to trigger lazy ``torch.compile`` compilation up front.
+    def warmup(self) -> None:
+        """Run a single dummy forward pass to pay one-off first-pass costs up front.
 
-        With ``torch.compile`` enabled the network is compiled lazily on its first
-        forward pass, which would otherwise make the user's *first* real prediction
-        slow. Every prediction path — the initial coarse pass, the zoom-out
-        iterations, and the refinement patches — feeds the network an input of
-        identical shape ``[1, num_input_channels + num_interaction_channels,
-        *patch_size]`` (``_build_network_input`` always resizes the crop to
-        ``patch_size``, and refinement crops at exactly ``patch_size``). So a single
-        dummy pass at that shape populates the compile cache and every subsequent
-        real prediction is fast.
+        This serves two purposes:
 
-        Returns ``True`` if a warmup pass was run, ``False`` if it was a no-op
-        (network not compiled — there is nothing to pre-compile, so a dummy pass
-        would not save the user any time). Mirrors ``_predict``'s autocast/
-        inference-mode context and the float32 input dtype that ``torch.cat``
-        produces when concatenating the float32 image with the fp16 interactions.
+        * **torch.compile**: with compilation enabled the network is compiled
+          lazily on its first forward pass, which would otherwise make the user's
+          *first* real prediction slow. The dummy pass triggers that compilation
+          here instead.
+        * **Device initialization (CUDA)**: even *without* ``torch.compile`` the
+          first forward pass on a fresh CUDA device pays one-off costs — cuDNN
+          autotunes/selects its convolution algorithms (``cudnn.benchmark`` is
+          enabled for CUDA in ``__init__`` and fires here), the caching allocator
+          grows its memory pool, and the CUDA context/kernels are loaded. Running
+          the dummy pass at startup pays those costs here rather than on the user's
+          first prediction.
+
+        Every prediction path — the initial coarse pass, the zoom-out iterations,
+        and the refinement patches — feeds the network an input of identical shape
+        ``[1, num_input_channels + num_interaction_channels, *patch_size]``
+        (``_build_network_input`` always resizes the crop to ``patch_size``, and
+        refinement crops at exactly ``patch_size``). So a single dummy pass at that
+        shape populates the compile cache and the cuDNN algorithm cache for every
+        subsequent real prediction.
+
+        Does nothing when there is nothing to gain: the network is neither compiled
+        (no compile cache to populate) nor on a CUDA device (no cuDNN autotuning /
+        allocator pool / context init to warm), so a dummy pass would not save the
+        user any time. Mirrors ``_predict``'s autocast/inference-mode context and
+        the float32 input dtype that ``torch.cat`` produces when concatenating the
+        float32 image with the fp16 interactions.
         """
         if self.network is None or self.configuration_manager is None:
             raise RuntimeError("warmup() requires an initialized network; call initialize_* first")
-        if not isinstance(self.network, OptimizedModule):
-            return False
+        if not isinstance(self.network, OptimizedModule) and self.device.type != "cuda":
+            return
         num_input_channels = (
             determine_num_input_channels(self.plans_manager, self.configuration_manager, self.dataset_json)
             + self.num_interaction_channels
         )
         patch_size = self.configuration_manager.patch_size
         dummy = torch.zeros((1, num_input_channels, *patch_size), dtype=torch.float32, device=self.device)
+        start = time()
         with torch.autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
             self.network(dummy)
         del dummy
         empty_cache(self.device)
-        return True
+        print(f"warmup forward pass complete in {time() - start:.1f}s; the first prediction will be fast")
 
     @torch.inference_mode()
     def _predict(self, force_full_refine: bool = False) -> Optional[List[List[int]]]:
@@ -1399,10 +1421,12 @@ class nnInteractiveInferenceSession:
 
                 refinement_bboxes = self._plan_refinement_bboxes(pred, scaled_bbox, force_full_refine)
 
-                # Place the coarse segmentation into prev_seg before refinement
-                paste_tensor(self.interactions, pred, scaled_bbox, channel_idx=prev_seg_channel)
-
-                self._refine_coarse(refinement_bboxes)
+                # NOTE: we deliberately do NOT write the coarse prediction into self.interactions here.
+                # The refinement network needs the coarse segmentation as prev_seg *input context*, but that
+                # context must stay confined to the local refinement cache (see _refine_coarse_with_local_cache).
+                # Committing it to the persistent prev_seg channel would leave coarse data in the gaps between
+                # refinement bboxes, poisoning the next prompt and (formerly) leaking into the target buffer.
+                self._refine_coarse(refinement_bboxes, pred, scaled_bbox)
 
         print(f"Done. Total time {round(time() - start_predict, 3)}s")
 
@@ -1488,21 +1512,54 @@ class nnInteractiveInferenceSession:
         empty_cache(self.device)
         return input_for_predict, scaled_patch_size, scaled_bbox, previous_prediction
 
-    def _refine_coarse(self, bboxes_ordered: List[List[List[int]]]):
+    def _refine_coarse(
+        self, bboxes_ordered: List[List[List[int]]], coarse_pred: torch.Tensor, coarse_bbox: List[List[int]]
+    ):
         start_refinement = time()
         prev_seg_channel = self._get_prev_seg_channel()
 
         if self.verbose:
             print(f"Using {len(bboxes_ordered)} bounding boxes for refinement")
 
-        self._refine_coarse_with_local_cache(bboxes_ordered, prev_seg_channel)
+        self._refine_coarse_with_local_cache(bboxes_ordered, prev_seg_channel, coarse_pred, coarse_bbox)
         end_refinement = time()
         print(
             f"Took {round(end_refinement - start_refinement, 3)} s for refining the segmentation with {len(bboxes_ordered)} bounding boxes"
         )
 
-    def _refine_coarse_with_local_cache(self, bboxes_ordered: List[List[List[int]]], prev_seg_channel: int) -> None:
+    def _refine_coarse_with_local_cache(
+        self,
+        bboxes_ordered: List[List[List[int]]],
+        prev_seg_channel: int,
+        coarse_pred: torch.Tensor,
+        coarse_bbox: List[List[int]],
+    ) -> None:
+        # The cache is cropped out of the *uncontaminated* self.interactions, so its prev_seg channel starts
+        # as the previous refined segmentation.
         cache_bbox, cache_image, cache_interactions = self._build_refinement_local_cache(bboxes_ordered)
+
+        # Inject the coarse prediction into the cache's prev_seg channel ONLY. This gives the refinement
+        # network the coarse context it needs to sharpen, but the coarse data lives exactly as long as the
+        # cache does -- it never reaches the persistent prev_seg channel or the target buffer.
+        #
+        # Restrict the injection to the in-image region. cache_bbox can extend past the image edge (refinement
+        # bboxes are not clipped to image bounds), and those out-of-image cache voxels are zero-padding that a
+        # border refinement patch also sees. Feeding coarse foreground into that padding would change the
+        # refined border vs. how the coarse pass itself was fed (prev_seg is 0-padded in _build_network_input),
+        # so we clip coarse_bbox to the image and slice coarse_pred to match, leaving out-of-image voxels at 0.
+        spatial_shape = tuple(int(i) for i in self.interactions.shape[1:])
+        inject_bbox = self._clip_bbox_to_shape(coarse_bbox, spatial_shape)
+        if inject_bbox is not None:
+            pred_slicer = tuple(slice(lb - c0, ub - c0) for (lb, ub), (c0, _) in zip(inject_bbox, coarse_bbox))
+            inject_local_bbox = [
+                [lb - cache_dim[0], ub - cache_dim[0]] for (lb, ub), cache_dim in zip(inject_bbox, cache_bbox)
+            ]
+            paste_tensor(
+                cache_interactions,
+                coarse_pred[pred_slicer].to(cache_interactions.device, dtype=cache_interactions.dtype),
+                inject_local_bbox,
+                channel_idx=prev_seg_channel,
+            )
 
         for refinement_bbox in bboxes_ordered:
             local_bbox = [
@@ -1533,9 +1590,26 @@ class nnInteractiveInferenceSession:
             del image_patch, interactions_patch, patch
             del pred
 
+        # Commit ONLY the refined bboxes into the persistent prev_seg channel and the target buffer. The gaps
+        # of the rectangular union hull (cache_bbox) still hold coarse data in the cache, so pasting the whole
+        # hull -- as we used to -- would leak that coarse prediction into both the persistent state (poisoning
+        # the next prompt) and the target buffer (which then "appears coarse"). Writing each refined bbox
+        # individually keeps every un-refined voxel at its previous full-resolution value; the coarse cache is
+        # discarded below.
         final_prev_seg = cache_interactions[prev_seg_channel]
-        paste_tensor(self.interactions, final_prev_seg, cache_bbox, channel_idx=prev_seg_channel)
-        self._paste_prediction_to_target_buffer(final_prev_seg, cache_bbox)
+        for refinement_bbox in bboxes_ordered:
+            local_bbox = [
+                [lb - cache_dim[0], ub - cache_dim[0]] for (lb, ub), cache_dim in zip(refinement_bbox, cache_bbox)
+            ]
+            local_slicer = tuple(slice(lb, ub) for lb, ub in local_bbox)
+            refined_patch = final_prev_seg[local_slicer]
+            paste_tensor(self.interactions, refined_patch, refinement_bbox, channel_idx=prev_seg_channel)
+            self._paste_prediction_to_target_buffer(refined_patch, refinement_bbox)
+
+        # Report the full refined ROI (union hull of all bboxes) as the changed region so remote clients copy
+        # every potentially-updated voxel in one shot; the per-bbox pastes above each left _last_paste_bbox at
+        # their own (smaller) box.
+        self._last_paste_bbox = cache_bbox
 
         del cache_image, cache_interactions, final_prev_seg
         empty_cache(self.device)
@@ -1721,16 +1795,17 @@ class nnInteractiveInferenceSession:
         """
         artifacts = self._load_model_artifacts_from_disk(model_training_output_dir, use_fold, checkpoint_name)
         self.initialize_from_loaded_artifacts(artifacts)
-        # With torch.compile the network is compiled lazily on the first forward pass. For a
-        # locally hosted model that lag would otherwise surface on the user's first real
-        # prediction, where it is far more noticeable than during initialization. Trigger the
-        # compilation now with a dummy forward pass so the cost is paid here instead. warmup()
-        # is a no-op when the network is not compiled. The server takes care of its own warmup
-        # explicitly (it shares one compiled network across sessions via
-        # initialize_from_loaded_artifacts), so we only do this on the direct, local entry point.
+        # Pay the one-off cost of the first forward pass now, at initialization, rather than on
+        # the user's first real prediction where it is far more noticeable. With torch.compile
+        # this triggers the (slow, once) lazy compilation; without it, the dummy forward pass
+        # still warms a fresh CUDA device (cuDNN algorithm selection / benchmark, allocator
+        # memory pool, CUDA context). warmup() is a no-op when there is nothing to gain (not
+        # compiled and not on CUDA). The server takes care of its own warmup explicitly (it
+        # shares one network across sessions via initialize_from_loaded_artifacts), so we only
+        # do this on the direct, local entry point.
         if self.use_torch_compile:
             print("torch.compile enabled; warming up (compiling) the network now (this is slow once)...")
-            self.warmup()
+        self.warmup()
 
     def _load_model_artifacts_from_disk(
         self,
