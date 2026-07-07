@@ -23,7 +23,6 @@ import sys
 from pathlib import Path
 import numpy as np
 import torch
-from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
 
 from nnInteractive.inference.inference_session import nnInteractiveInferenceSession
 
@@ -72,6 +71,9 @@ def run_inference(
         verbose=False,
         torch_n_threads=os.cpu_count(),
         do_autozoom=True,
+        # This script never calls undo(); skip the per-interaction snapshot cost
+        # (every run_prediction=False add would otherwise compress the full state).
+        enable_undo=False,
     )
     session.initialize_from_trained_model_folder(
         model_training_output_dir=CHECKPOINT_DIR,
@@ -117,9 +119,7 @@ def run_inference(
 
                 print(f"Class {oid}: {kind} click at {click}")
                 session.add_point_interaction(click, include_interaction=kind == "fg", run_prediction=False)
-        # now run inference on the last interaction center
-        session.new_interaction_centers = [session.new_interaction_centers[-1]]
-        session.new_interaction_zoom_out_factors = [session.new_interaction_zoom_out_factors[-1]]
+        # now run inference (_predict uses only the last queued interaction center)
         session._predict()
         result[session.target_buffer > 0] = oid
     del session

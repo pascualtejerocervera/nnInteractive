@@ -1,11 +1,9 @@
-import os
 import torch
 from typing import List
 import numpy as np
 from reader import NfitiReaderWriter, BloscReaderWriter
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 from sam2.sam2.build_sam import build_sam2_video_predictor
-from tqdm import tqdm
 import concurrent.futures
 import cc3d
 
@@ -28,12 +26,6 @@ class SuperVoxelGenerator:
         self.reader_writer = {".nii.gz": NfitiReaderWriter(), ".b2nd": BloscReaderWriter()}[self.file_format]
         print(f"Using {self.reader_writer} to read and write files")
 
-        # Get the list of files to process
-        self.list_of_files = [
-            f
-            for f in os.listdir(input_dir)
-            if f.endswith(config["file_format"]) and config["excluded_strings"] not in f
-        ]
         self.config = config
 
         self.sam = sam_model_registry["vit_h"](checkpoint=self.config["sam1_checkpoint"]).to("cuda")
@@ -61,7 +53,9 @@ class SuperVoxelGenerator:
             masks (List[np.ndarray]): A list of masks to propagate. Shape: (z, y, x)
             slice_idx (int): The index of the slice which contains the masks
         """
-        propagated_masks = np.zeros((len(masks), *image_data.shape))
+        # Only 0/1 values are ever written (and the result is binarized to uint8 downstream),
+        # so uint8 suffices — float64 would be 8x the RAM for a full-volume stack.
+        propagated_masks = np.zeros((len(masks), *image_data.shape), dtype=np.uint8)
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
 
             for obj_id, m in enumerate(masks):
@@ -99,21 +93,19 @@ class SuperVoxelGenerator:
 
     def remove_other_components(self, masks, frame_idx):
         """
-        Remove components other than the one overlaping with the seed mask in the given frame
+        Remove components other than the one overlapping with the seed mask in the given frame
 
         Parameters:
             mask (np.ndarray): The mask to process. Shape: (n, z, y, x)
             frame_idx (int): The index of the frame
         """
         filtered_masks = []
-        for i, m in enumerate(masks):
-            m_cc, num_cc = cc3d.connected_components(m, connectivity=26, binary_image=True, return_N=True)
+        for m in masks:
+            m_cc = cc3d.connected_components(m, connectivity=26, binary_image=True)
 
-            # keep all the components that overlap with the seed mask
-            filtered_components = []
-            for n in range(1, num_cc + 1):
-                if np.sum(m_cc[frame_idx] == n) > 0:
-                    filtered_components.append(n)
+            # keep one random component among those that overlap with the seed mask
+            filtered_components = np.unique(m_cc[frame_idx])
+            filtered_components = filtered_components[filtered_components != 0]
             if len(filtered_components) != 0:
                 final_component = np.random.choice(filtered_components)
                 filtered_masks.append((m_cc == final_component).astype(np.uint8))
@@ -128,9 +120,8 @@ class SuperVoxelGenerator:
             image_data (np.ndarray): The image data to process. Shape: (z, y, x)
         """
         # Normalize between 0 to 1 using 95 percentile
-        image_data = (image_data - np.percentile(image_data, 5)) / (
-            np.percentile(image_data, 95) - np.percentile(image_data, 5)
-        )
+        p5, p95 = np.percentile(image_data, [5, 95])
+        image_data = (image_data - p5) / (p95 - p5)
         data_shape = image_data.shape
 
         # Sample random slice with Gaussian probability
@@ -166,33 +157,7 @@ class SuperVoxelGenerator:
         # Remove other components
         propagated_masks = self.remove_other_components(propagated_masks, slice_idx)
 
-        # Binrize the masks
+        # Binarize the masks
         propagated_masks = (propagated_masks > 0).astype(np.uint8)
 
-        # viewer = napari.Viewer()
-        # viewer.add_image(image_data)
-        # viewer.add_labels(propagated_masks.astype(np.uint8))
-        # napari.run()
-
         return propagated_masks
-
-    def process_images(self):
-        """
-        Process the images in the list_of_images and generate the supervoxels segmentation masks.
-        """
-        print(f"Processing {self.list_of_files} images")
-
-        for image_name in tqdm(self.list_of_files):
-            out_path = os.path.join(self.output_dir, image_name)
-            if os.path.exists(out_path):
-                continue
-
-            image_data, metadata = self.reader_writer.read(os.path.join(self.input_dir, image_name))
-
-            if len(image_data.shape) == 4:
-                image_data = image_data[0]
-            out_img = self.sam_supervoxel(image_data)
-
-            if os.path.exists(out_path):
-                continue
-            self.reader_writer.write(out_img, metadata, out_path)

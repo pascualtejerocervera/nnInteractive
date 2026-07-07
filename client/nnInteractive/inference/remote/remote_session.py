@@ -143,11 +143,13 @@ class nnInteractiveRemoteInferenceSession:
         expiry: ``httpx.ReadTimeout``.
     set_image_read_timeout:
         Read timeout (seconds) used *only* for ``set_image``. After the volume
-        is uploaded, the server decompresses and preprocesses the full image
-        before responding, which can take far longer than a prediction on a
-        large volume. ``set_image`` therefore gets its own generous read
-        timeout instead of the much tighter ``read_timeout`` used for
-        predictions. On expiry: ``httpx.ReadTimeout``.
+        is uploaded, the server decompresses the full image before responding
+        (current servers then respond immediately and preprocess in the
+        background; older servers block on the full preprocessing too), which
+        can take far longer than a prediction on a large volume. ``set_image``
+        therefore gets its own generous read timeout instead of the much
+        tighter ``read_timeout`` used for predictions. On expiry:
+        ``httpx.ReadTimeout``.
     write_timeout:
         Seconds to finish uploading the request body. ``set_image`` uploads
         the full 4D volume so this is the longest-running upload. On expiry:
@@ -189,7 +191,8 @@ class nnInteractiveRemoteInferenceSession:
         )
         # Per-request timeout override for set_image: same connect/write/pool as
         # the client default, but a much longer read budget for server-side
-        # decompression + preprocessing of the full volume.
+        # decompression of the full volume (and, on older servers, its full
+        # preprocessing too — current servers preprocess in the background).
         self._set_image_timeout = httpx.Timeout(
             connect=connect_timeout,
             read=set_image_read_timeout,
@@ -563,9 +566,7 @@ class nnInteractiveRemoteInferenceSession:
         You normally never call this yourself: the session auto-heartbeats from
         a background thread for the lifetime of the object.
         """
-        resp = self._http.post(PATH_HEARTBEAT)
-        _raise_for_lease_errors(resp)
-        resp.raise_for_status()
+        resp = self._post_json(PATH_HEARTBEAT, {})
         return float(resp.json().get("remaining_seconds", 0.0))
 
     def _heartbeat_loop(self) -> None:
@@ -596,10 +597,7 @@ class nnInteractiveRemoteInferenceSession:
         Does NOT extend the lease — use ``heartbeat()`` for that. Raises
         :class:`SessionExpiredError` if the lease is already gone.
         """
-        resp = self._http.get(PATH_LEASE_STATUS)
-        _raise_for_lease_errors(resp)
-        resp.raise_for_status()
-        return resp.json()
+        return self._get_json(PATH_LEASE_STATUS)
 
     def close(self) -> None:
         # Stop the heartbeat thread first so it can't use self._http after we

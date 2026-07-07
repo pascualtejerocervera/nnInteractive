@@ -95,77 +95,54 @@ class PointInteraction_stub:
         Returns:
         The updated interaction map (torch.Tensor for the default path; blosc2 NDArray for channel_idx path).
         """
-        if channel_idx is not None:
-            # blosc2 path: interaction_map is the full 4D NDArray; channel_idx selects the channel.
-            spatial_shape = interaction_map.shape[1:]
-            ndim = len(spatial_shape)
+        # Geometry is identical for both paths; only the final write differs.
+        # channel_idx path: interaction_map is the full 4D array (torch tensor or blosc2 NDArray).
+        # Default path: interaction_map is a single-channel tensor.
+        spatial_shape = tuple(interaction_map.shape[1:] if channel_idx is not None else interaction_map.shape)
+        ndim = len(spatial_shape)
 
-            radius = tuple([sample_scalar(self.point_radius, d, spatial_shape) for d in range(ndim)])
-            strel = build_point(radius, self.use_distance_transform, binarize)
-            if intensity_scale != 1.0:
-                strel = strel * intensity_scale
-
-            bbox = [
-                [position[i] - strel.shape[i] // 2, position[i] + strel.shape[i] // 2 + strel.shape[i] % 2]
-                for i in range(ndim)
-            ]
-
-            # detect if bbox is completely outside interaction_map
-            if any(i[1] < 0 for i in bbox) or any(i[0] > s for i, s in zip(bbox, spatial_shape)):
-                print("Point is outside the interaction map! Ignoring")
-                print(f"Position: {position}")
-                print(f"Interaction map shape: {spatial_shape}")
-                print(f"Point bbox would have been {bbox}")
-                return interaction_map
-
-            slices = tuple(slice(max(0, bbox[i][0]), min(spatial_shape[i], bbox[i][1])) for i in range(ndim))
-            structuring_slices = tuple(
-                slice(max(0, -bbox[i][0]), slices[i].stop - slices[i].start + max(0, -bbox[i][0])) for i in range(ndim)
-            )
-
-            target_slices = (channel_idx, *slices)
-            if isinstance(interaction_map, torch.Tensor):
-                # Dense torch backend: in-place maximum, no numpy round-trip.
-                view = interaction_map[target_slices]
-                torch.maximum(view, strel[structuring_slices].to(view.dtype), out=view)
-                return interaction_map
-            current_sub = np.asarray(interaction_map[target_slices])
-            strel_np = strel[structuring_slices].numpy().astype(current_sub.dtype)
-            np.maximum(current_sub, strel_np, out=current_sub)
-            interaction_map[target_slices] = current_sub
-            return interaction_map
-
-        # Default torch path: interaction_map is a 3D tensor for a single channel.
-        ndim = interaction_map.ndim
-
-        # Determine the radius for each dimension
-        radius = tuple([sample_scalar(self.point_radius, d, interaction_map.shape) for d in range(ndim)])
-
+        radius = tuple(sample_scalar(self.point_radius, d, spatial_shape) for d in range(ndim))
         strel = build_point(radius, self.use_distance_transform, binarize)
         if intensity_scale != 1.0:
             strel = strel * intensity_scale
 
-        # Calculate slice range in each dimension, ensuring it is within the bounds of the interaction map
         bbox = [
             [position[i] - strel.shape[i] // 2, position[i] + strel.shape[i] // 2 + strel.shape[i] % 2]
             for i in range(ndim)
         ]
         # detect if bbox is completely outside interaction_map
-        if any([i[1] < 0 for i in bbox]) or any([i[0] > s for i, s in zip(bbox, interaction_map.shape)]):
+        if any(i[1] < 0 for i in bbox) or any(i[0] > s for i, s in zip(bbox, spatial_shape)):
             print("Point is outside the interaction map! Ignoring")
             print(f"Position: {position}")
-            print(f"Interaction map shape: {interaction_map.shape}")
+            print(f"Interaction map shape: {spatial_shape}")
             print(f"Point bbox would have been {bbox}")
             return interaction_map
-        slices = tuple(slice(max(0, bbox[i][0]), min(interaction_map.shape[i], bbox[i][1])) for i in range(ndim))
 
-        # Calculate where the resized structuring element should be placed within the slices
+        # Clip the point bbox to the map and compute the matching subregion of the structuring element.
+        slices = tuple(slice(max(0, bbox[i][0]), min(spatial_shape[i], bbox[i][1])) for i in range(ndim))
         structuring_slices = tuple(
-            [slice(max(0, -bbox[i][0]), slices[i].stop - slices[i].start + max(0, -bbox[i][0])) for i in range(ndim)]
+            slice(max(0, -bbox[i][0]), slices[i].stop - slices[i].start + max(0, -bbox[i][0])) for i in range(ndim)
         )
 
-        # Place the resized structuring element into the interaction map
-        torch.maximum(
-            interaction_map[slices], strel[structuring_slices].to(interaction_map.device), out=interaction_map[slices]
-        )
+        if channel_idx is None:
+            # Single-channel tensor: place the structuring element via in-place maximum.
+            torch.maximum(
+                interaction_map[slices],
+                strel[structuring_slices].to(interaction_map.device),
+                out=interaction_map[slices],
+            )
+            return interaction_map
+
+        target_slices = (channel_idx, *slices)
+        if isinstance(interaction_map, torch.Tensor):
+            # Dense torch backend: in-place maximum, no numpy round-trip.
+            view = interaction_map[target_slices]
+            torch.maximum(view, strel[structuring_slices].to(view.dtype), out=view)
+            return interaction_map
+        # blosc2 backend: read-modify-write only the structuring element subregion
+        # (avoids decompressing the full channel).
+        current_sub = np.asarray(interaction_map[target_slices])
+        strel_np = strel[structuring_slices].numpy().astype(current_sub.dtype)
+        np.maximum(current_sub, strel_np, out=current_sub)
+        interaction_map[target_slices] = current_sub
         return interaction_map

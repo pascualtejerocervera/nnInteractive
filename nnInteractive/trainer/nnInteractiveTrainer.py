@@ -15,10 +15,12 @@ class nnInteractiveTrainer_stub:
         num_output_channels: int,
         enable_deep_supervision: bool = True,
     ) -> nn.Module:
+        # nnInteractive networks always have 2 outputs (nnU-Net handles one-class segmentation
+        # as CE, so binary = 2 channels); callers are expected to pass num_output_channels=2.
         return nnUNetTrainer.build_network_architecture(
             plans_manager,
             configuration_manager,
             num_input_channels,
-            2,  # nnunet handles one class segmentation still as CE so we need 2 outputs.
+            num_output_channels,
             enable_deep_supervision,
         )

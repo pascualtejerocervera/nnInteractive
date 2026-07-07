@@ -89,8 +89,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Disable single-level undo for all sessions server-wide (default: enabled). Undo "
         "snapshots the interaction tensor and target buffer before each interaction, costing extra "
         "RAM per session and some background CPU per prediction. Pass this to skip that overhead "
-        "when clients never undo; the /undo endpoint then always reports nothing to undo. Clients "
-        "may also opt their own session out of undo without this flag.",
+        "when clients never undo; the /undo endpoint then always reports nothing to undo. Undo is "
+        "a server-startup decision — there is no per-client toggle.",
     )
     p.add_argument(
         "--max-sessions",
@@ -163,12 +163,21 @@ def _resolve_model_source(args) -> str:
         ensure_model_available,
         get_default_model_id,
         get_model_root_dir,
+        load_model_manifest,
     )
 
     try:
-        model_id = args.model or get_default_model_id()
+        if args.model:
+            # Explicit id: no manifest needed for the already-downloaded fast path;
+            # ensure_model_available loads it itself only if a download is required.
+            model_id, manifest = args.model, None
+        else:
+            # Default-model path needs the manifest anyway; load it once and reuse it
+            # for the download so we don't fetch it from Hugging Face twice.
+            manifest = load_model_manifest()
+            model_id = get_default_model_id(manifest=manifest)
         logger.info("Resolving official model '%s' (model root: %s)", model_id, get_model_root_dir())
-        return str(ensure_model_available(model_id))
+        return str(ensure_model_available(model_id, manifest=manifest))
     except (RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc))
 

@@ -117,11 +117,9 @@ def pack_array(
     it for this call only, without mutating global state.
     """
     arr = np.ascontiguousarray(arr)
-    dtype_str = arr.dtype.str.lstrip("<>|=").encode("ascii")
     if arr.dtype.byteorder not in ("=", "|", "<"):
         # Force little-endian on the wire so the reader doesn't need to swap.
         arr = arr.astype(arr.dtype.newbyteorder("<"))
-        dtype_str = arr.dtype.str.lstrip("<>|=").encode("ascii")
 
     # Use a stable, readable dtype string (e.g. "float32") rather than the
     # platform-dependent shorthand ("f4").
@@ -193,37 +191,35 @@ def unpack_array(buf: bytes) -> np.ndarray:
 
     dtype = np.dtype(name)
 
-    # Decompress each chunk straight into a preallocated output buffer so we
-    # don't materialize the full uncompressed payload as a separate bytes
-    # object before reshaping.
+    # Decompress each chunk straight into the preallocated output array (dst=...) so we never
+    # materialize an uncompressed chunk as a separate bytes object (saves one full-payload
+    # allocation + memcpy per unpack). blosc2 does NOT reliably error on a mis-sized dst, so
+    # the chunk's true uncompressed size is validated up front via the frame header
+    # (get_cbuffer_sizes) instead of after the fact.
     (nchunks,) = struct.unpack_from("<I", buf, offset)
     offset += 4
     nelem = 1
     for d in shape:
         nelem *= d
     out = np.empty(nelem, dtype=dtype)
-    out_view = memoryview(out).cast("B")
+    itemsize = dtype.itemsize
+    total_bytes = nelem * itemsize
+    mv = memoryview(buf)
     written = 0
     for _ in range(nchunks):
         ulen, clen = struct.unpack_from("<QQ", buf, offset)
         offset += 16
-        chunk = blosc2.decompress2(buf[offset : offset + clen])
-        if len(chunk) != ulen:
-            raise ValueError(f"chunk size mismatch: header says {ulen} bytes, decoded {len(chunk)}")
-        if written + ulen > out_view.nbytes:
+        if written + ulen > total_bytes:
             raise ValueError("payload larger than declared array shape")
-        out_view[written : written + ulen] = chunk
+        if ulen % itemsize:
+            raise ValueError(f"chunk length {ulen} is not a multiple of itemsize {itemsize}")
+        src = mv[offset : offset + clen]
+        nbytes, _, _ = blosc2.get_cbuffer_sizes(src)
+        if nbytes != ulen:
+            raise ValueError(f"chunk size mismatch: header says {ulen} bytes, frame says {nbytes}")
+        blosc2.decompress2(src, dst=out[written // itemsize : (written + ulen) // itemsize])
         written += ulen
         offset += clen
-    if written != out_view.nbytes:
-        raise ValueError(f"payload size mismatch: expected {out_view.nbytes} bytes, got {written}")
+    if written != total_bytes:
+        raise ValueError(f"payload size mismatch: expected {total_bytes} bytes, got {written}")
     return out.reshape(shape)
-
-
-def empty_payload() -> bytes:
-    """Return a placeholder payload used when no array is being shipped."""
-    return b""
-
-
-def is_empty_payload(buf: Optional[bytes]) -> bool:
-    return buf is None or len(buf) == 0
