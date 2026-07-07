@@ -154,6 +154,10 @@ class nnInteractiveRemoteInferenceSession:
         ``httpx.WriteTimeout``.
     pool_timeout:
         Seconds to wait for an httpx connection from the pool.
+
+    Undo availability is decided by the server at startup (``--no-undo``): when
+    the server disables it, ``supports_undo`` reports ``False`` and ``undo()``
+    returns ``False``. There is no per-client undo toggle.
     """
 
     def __init__(
@@ -234,7 +238,8 @@ class nnInteractiveRemoteInferenceSession:
         # "!!MISSING!!" means the server could not determine the license.
         self.license: Optional[str] = caps.get("license")
         # Older servers predate the /undo endpoint and omit this flag; default False so the
-        # GUI can disable undo instead of issuing requests that would 404.
+        # GUI can disable undo instead of issuing requests that would 404. Also False when the
+        # server was started with --no-undo (undo disabled server-wide).
         self.supports_undo: bool = bool(caps.get("supports_undo", False))
 
         self.original_image_shape: Optional[Tuple[int, ...]] = None

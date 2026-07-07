@@ -41,7 +41,8 @@ class nnInteractiveInferenceSession:
     # is a PEP 420 namespace package (no __init__ to carry __version__), so read it
     # from the distribution metadata instead.
     INFERENCE_SESSION_VERSION = _package_version("nnInteractive")
-    # Single-level undo of the last interaction is always available (see undo()).
+    # Single-level undo of the last interaction (see undo()). Enabled by default; a per-instance
+    # `supports_undo` set in __init__ from `enable_undo` shadows this class default when undo is off.
     supports_undo: bool = True
     REFINEMENT_CACHE_GPU_HEADROOM_BYTES = 4 * 1024**3
     # Maximum adaptive zoom-out factor (see _predict). Also bounds the largest interaction crop,
@@ -62,6 +63,7 @@ class nnInteractiveInferenceSession:
         torch_n_threads: int = 8,
         do_autozoom: bool = True,
         interactions_storage: str = "auto",
+        enable_undo: bool = True,
     ):
         """
         Only intended to work with nnInteractiveTrainerV2 and its derivatives
@@ -72,6 +74,14 @@ class nnInteractiveInferenceSession:
         This is recommended for the persistent inference server, where the
         process is long-lived so the one-time compile cost is paid only once and
         amortized across the whole session lifetime.
+
+        ``enable_undo``: keep single-level undo of the last interaction available
+        (default ``True``; see ``undo()``). Undo works by snapshotting the
+        interaction tensor and target buffer before each interaction, which costs
+        extra RAM (a compressed copy of both) and some background CPU per
+        prediction. Set to ``False`` when you know you will never call ``undo()``
+        to skip that overhead entirely; ``undo()`` then always returns ``False``
+        and ``supports_undo`` reports ``False``.
 
         ``interactions_storage``: storage backend for the interaction tensor, one of
         ``"blosc2"``, ``"tensor"`` or ``"auto"`` (default).
@@ -157,11 +167,15 @@ class nnInteractiveInferenceSession:
         # fetch just the touched region without diffing.
         self._last_paste_bbox: Optional[List[List[int]]] = None
 
-        # Single-level undo. _undo_snapshot holds a blosc2-compressed copy of the state
-        # *before* the most recent interaction (the restore target). _pending_snapshot_future
-        # is an in-flight async snapshot of the current state, kicked off after each prediction
-        # while the user decides on the next prompt; it is promoted into _undo_snapshot at the
-        # start of the next interaction. See _snapshot_state / _commit_pending_snapshot / undo.
+        # Single-level undo. When disabled (enable_undo=False) no snapshots are taken at all, so
+        # undo() always returns False and none of the snapshot RAM/CPU cost is paid.
+        # _undo_snapshot holds a blosc2-compressed copy of the state *before* the most recent
+        # interaction (the restore target). _pending_snapshot_future is an in-flight async snapshot
+        # of the current state, kicked off after each prediction while the user decides on the next
+        # prompt; it is promoted into _undo_snapshot at the start of the next interaction. See
+        # _snapshot_state / _commit_pending_snapshot / undo.
+        self.enable_undo: bool = enable_undo
+        self.supports_undo: bool = enable_undo
         self._undo_snapshot: Optional[dict] = None
         self._pending_snapshot_future = None
 
@@ -992,6 +1006,9 @@ class nnInteractiveInferenceSession:
         """Promote the in-flight snapshot to the undo target. Called at the start of every
         add_*_interaction, before any state is mutated. Falls back to a synchronous snapshot of
         the current state when none is in flight (first interaction, or a prior run_prediction=False)."""
+        if not self.enable_undo:
+            # Undo disabled: never snapshot, so no undo target is ever established.
+            return
         if self._pending_snapshot_future is not None:
             self._undo_snapshot = self._pending_snapshot_future.result()
             self._pending_snapshot_future = None
@@ -1006,9 +1023,10 @@ class nnInteractiveInferenceSession:
 
         Single level: only the last interaction can be undone. Returns True if something was undone,
         False if there was nothing to undo. After undo, the (now current) state becomes undoable again
-        only once a new interaction is added.
+        only once a new interaction is added. Always returns False when the session was created with
+        enable_undo=False (no snapshots are taken in that case).
         """
-        if self._undo_snapshot is None:
+        if not self.enable_undo or self._undo_snapshot is None:
             return False
         self._drain_pending_snapshot()
         # Diff the live target buffer against the snapshot before restoring, so remote callers can
@@ -1436,7 +1454,9 @@ class nnInteractiveInferenceSession:
 
         # Asynchronously snapshot the now-settled state while the user decides on the next prompt.
         # The next interaction blocks on this in _commit_pending_snapshot before mutating anything.
-        self._pending_snapshot_future = self.executor.submit(self._snapshot_state)
+        # Skipped entirely when undo is disabled.
+        if self.enable_undo:
+            self._pending_snapshot_future = self.executor.submit(self._snapshot_state)
 
         return self._clipped_last_paste_bbox()
 

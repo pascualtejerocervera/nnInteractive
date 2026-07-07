@@ -84,6 +84,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Disable adaptive zoom-out (default: enabled)",
     )
     p.add_argument(
+        "--no-undo",
+        action="store_true",
+        help="Disable single-level undo for all sessions server-wide (default: enabled). Undo "
+        "snapshots the interaction tensor and target buffer before each interaction, costing extra "
+        "RAM per session and some background CPU per prediction. Pass this to skip that overhead "
+        "when clients never undo; the /undo endpoint then always reports nothing to undo. Clients "
+        "may also opt their own session out of undo without this flag.",
+    )
+    p.add_argument(
         "--max-sessions",
         type=int,
         default=3,
@@ -296,6 +305,7 @@ def main(argv=None) -> int:
         interactions_storage=args.interactions_storage,
         verbose=args.verbose,
         api_key=api_key,
+        enable_undo=not args.no_undo,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return 0

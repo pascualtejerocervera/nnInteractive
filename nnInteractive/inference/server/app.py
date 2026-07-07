@@ -165,6 +165,7 @@ class SessionRegistry:
         use_torch_compile: bool,
         interactions_storage: str,
         verbose: bool,
+        enable_undo: bool = True,
     ) -> None:
         self._artifacts = artifacts
         self._max_sessions = int(max_sessions)
@@ -176,6 +177,9 @@ class SessionRegistry:
         self._use_torch_compile = use_torch_compile
         self._interactions_storage = interactions_storage
         self._verbose = verbose
+        # Server-wide undo policy, decided once at startup (--no-undo). Every session is created
+        # with this value; clients have no say. When False, no session takes undo snapshots.
+        self._enable_undo = bool(enable_undo)
         self._entries: dict[str, SessionEntry] = {}
         self._mu = threading.Lock()
 
@@ -204,6 +208,7 @@ class SessionRegistry:
                 torch_n_threads=self._torch_n_threads,
                 do_autozoom=self._do_autozoom,
                 interactions_storage=self._interactions_storage,
+                enable_undo=self._enable_undo,
             )
             session.initialize_from_loaded_artifacts(self._artifacts)
             entry = SessionEntry(session)
@@ -309,6 +314,7 @@ def make_app(
     verbose: bool = False,
     api_key: Optional[str] = None,
     sweep_interval_seconds: float = 15.0,
+    enable_undo: bool = True,
 ) -> FastAPI:
     registry = SessionRegistry(
         artifacts=artifacts,
@@ -321,6 +327,7 @@ def make_app(
         use_torch_compile=use_torch_compile,
         interactions_storage=interactions_storage,
         verbose=verbose,
+        enable_undo=enable_undo,
     )
     gpu_lock = threading.Lock()
 
@@ -371,6 +378,7 @@ def make_app(
         torch_n_threads=torch_n_threads,
         do_autozoom=do_autozoom,
         interactions_storage=interactions_storage,
+        enable_undo=enable_undo,
     )
     _capability_session.initialize_from_loaded_artifacts(artifacts)
     _capability_snapshot = _build_capability_snapshot(_capability_session)
@@ -771,5 +779,6 @@ def _build_capability_snapshot(session: nnInteractiveInferenceSession) -> dict:
         "do_autozoom": bool(session.do_autozoom),
         "inference_session_version": session.INFERENCE_SESSION_VERSION,
         "license": session.license,
-        "supports_undo": True,
+        # Reflects the server-wide undo policy (--no-undo): whether undo is available on this server.
+        "supports_undo": bool(session.supports_undo),
     }
