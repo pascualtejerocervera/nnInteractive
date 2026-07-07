@@ -510,24 +510,61 @@ class nnInteractiveInferenceSession:
 
         return torch.device("cpu")
 
+    @staticmethod
+    def _zero_out_of_image_cache_border_(
+        cache: torch.Tensor, cache_bbox: List[List[int]], spatial_shape: Tuple[int, ...]
+    ) -> None:
+        """Zero only the parts of an uninitialized (torch.empty) cache that lie outside the image.
+
+        Refinement bboxes are not clipped to the image, so the cache can extend past the image
+        bounds; those voxels act as zero-padding and are the only ones the
+        crop_and_pad_into_buffer calls in _build_refinement_local_cache do not overwrite.
+        Zeroing just this border instead of the whole cache saves a full memset over the
+        (potentially multi-GB) cache.
+        """
+        lead = cache.ndim - len(cache_bbox)
+        for d, (lb, ub) in enumerate(cache_bbox):
+            size = int(ub - lb)
+            left = min(max(int(-lb), 0), size)
+            right = min(max(int(ub - spatial_shape[d]), 0), size)
+            if left > 0:
+                slicer = [slice(None)] * cache.ndim
+                slicer[lead + d] = slice(0, left)
+                cache[tuple(slicer)] = 0
+            if right > 0:
+                slicer = [slice(None)] * cache.ndim
+                slicer[lead + d] = slice(size - right, size)
+                cache[tuple(slicer)] = 0
+
     def _build_refinement_local_cache(self, bboxes_ordered: List[List[List[int]]]):
         cache_bbox = self._union_bboxes(*bboxes_ordered)
         cache_device = self._select_refinement_cache_device(cache_bbox)
         cache_shape = self._bbox_size(cache_bbox)
-        pin_cache = cache_device.type == "cpu" and self.device.type == "cuda"
 
-        cache_kwargs = {"device": cache_device}
-        if pin_cache:
-            cache_kwargs["pin_memory"] = True
-
-        cache_image = torch.zeros(cache_shape, dtype=self.preprocessed_image.dtype, **cache_kwargs)
-        cache_interactions = torch.zeros(
-            (self.num_interaction_channels, *cache_shape), dtype=torch.float16, **cache_kwargs
+        # torch.empty + border-only zeroing: the in-image interior is fully overwritten by the
+        # crop_and_pad_into_buffer calls below. No pin_memory for a CPU cache: pinning multiple GB
+        # costs seconds (cudaHostAlloc page-pinning) and would not even speed up the per-patch
+        # reads, which are non-contiguous slices that cannot DMA directly from pinned memory --
+        # they are staged through small reusable pinned buffers in _refine_coarse_with_local_cache.
+        cache_image = torch.empty(cache_shape, dtype=self.preprocessed_image.dtype, device=cache_device)
+        cache_interactions = torch.empty(
+            (self.num_interaction_channels, *cache_shape), dtype=torch.float16, device=cache_device
         )
+        spatial_shape = tuple(int(i) for i in self.interactions.shape[1:])
+        self._zero_out_of_image_cache_border_(cache_image, cache_bbox, spatial_shape)
+        self._zero_out_of_image_cache_border_(cache_interactions, cache_bbox, spatial_shape)
 
         crop_and_pad_into_buffer(cache_image, cache_bbox, self.preprocessed_image[0])
         crop_and_pad_into_buffer(cache_interactions, cache_bbox, self.interactions)
-        self._normalize_interaction_channels_for_network_(cache_interactions)
+        # .type comparison: torch.device("cuda") != torch.device("cuda:0"), but both mean "the
+        # compute device" here (_select_refinement_cache_device only returns self.device or cpu).
+        # Must stay consistent with the same check in _refine_coarse_with_local_cache, which
+        # normalizes per patch exactly when the cache is NOT normalized here.
+        if cache_device.type == self.device.type:
+            # Cheap on the compute device. A CPU cache is kept unnormalized instead -- in-place
+            # fp16 division over the whole cache is slow on CPU -- and every patch is normalized
+            # on the compute device after transfer (see _refine_coarse_with_local_cache).
+            self._normalize_interaction_channels_for_network_(cache_interactions)
         return cache_bbox, cache_image, cache_interactions
 
     def _prepare_new_interaction_intensity(self):
@@ -1611,36 +1648,68 @@ class nnInteractiveInferenceSession:
         if inject_bbox is not None:
             pred_slicer = bounding_box_to_slice(self._bbox_to_local(inject_bbox, coarse_bbox))
             inject_local_bbox = self._bbox_to_local(inject_bbox, cache_bbox)
-            paste_tensor(
-                cache_interactions,
-                coarse_pred[pred_slicer].to(cache_interactions.device, dtype=cache_interactions.dtype),
-                inject_local_bbox,
-                channel_idx=prev_seg_channel,
-            )
+            coarse_sub = coarse_pred[pred_slicer]
+            if cache_interactions.device.type == "cpu":
+                # Transfer at the narrow source dtype (uint8: half the D2H bytes of fp16) and let
+                # the paste widen to the cache dtype on CPU.
+                coarse_sub = coarse_sub.to("cpu")
+            else:
+                coarse_sub = coarse_sub.to(cache_interactions.device, dtype=cache_interactions.dtype)
+            paste_tensor(cache_interactions, coarse_sub, inject_local_bbox, channel_idx=prev_seg_channel)
+            del coarse_sub
+
+        # A CPU cache pays a host->device transfer per patch. The patch slices are non-contiguous
+        # views, which torch copies through a freshly allocated pageable staging area (making
+        # non_blocking a no-op). Gathering into small reusable pinned staging buffers instead
+        # turns the H2D copy into a true DMA and avoids the per-patch allocation.
+        use_pinned_staging = (
+            cache_image.device.type == "cpu" and self.device.type == "cuda" and not is_linux_kernel_6_11()
+        )
+        stage_image = stage_interactions = None
 
         for refinement_bbox in bboxes_ordered:
             local_bbox = self._bbox_to_local(refinement_bbox, cache_bbox)
             spatial_slicer = bounding_box_to_slice(local_bbox)
             image_patch = cache_image[spatial_slicer][None]
             interactions_patch = cache_interactions[(slice(None), *spatial_slicer)]
-            if cache_image.device == self.device:
+            # .type comparison, consistent with _build_refinement_local_cache: this branch must be
+            # taken exactly when the cache was normalized at build. An == comparison would send a
+            # cuda:0 cache down the else branch (torch.device("cuda") != torch.device("cuda:0")),
+            # where .to() returns a *view* of the cache and the per-patch normalization would then
+            # corrupt it in place (double-normalizing overlapping patches).
+            if cache_image.device.type == self.device.type:
+                # Cache lives on the compute device (already normalized at build): patches are
+                # views, the cat is the only copy.
                 patch = torch.cat((image_patch, interactions_patch), dim=0)
             else:
-                patch = torch.cat(
-                    (
-                        image_patch.to(self.device, non_blocking=(self.device.type == "cuda")),
-                        interactions_patch.to(self.device, non_blocking=(self.device.type == "cuda")),
-                    ),
-                    dim=0,
-                )
+                if use_pinned_staging:
+                    if stage_image is None or stage_image.shape != image_patch.shape:
+                        stage_image = torch.empty(image_patch.shape, dtype=image_patch.dtype, pin_memory=True)
+                        stage_interactions = torch.empty(
+                            interactions_patch.shape, dtype=interactions_patch.dtype, pin_memory=True
+                        )
+                    # Overwriting the staging buffers is safe: the synchronous D2H copy of the
+                    # previous iteration's prediction (below) synchronized the stream, so the
+                    # previous H2D copies out of these buffers have completed.
+                    stage_image.copy_(image_patch)
+                    stage_interactions.copy_(interactions_patch)
+                    image_patch, interactions_patch = stage_image, stage_interactions
+                image_gpu = image_patch.to(self.device, non_blocking=use_pinned_staging)
+                interactions_gpu = interactions_patch.to(self.device, non_blocking=use_pinned_staging)
+                # A CPU cache is stored unnormalized (see _build_refinement_local_cache): normalize
+                # the per-patch copy on the compute device, where the fp16 division is cheap.
+                self._normalize_interaction_channels_for_network_(interactions_gpu)
+                patch = torch.cat((image_gpu, interactions_gpu), dim=0)
+                del image_gpu, interactions_gpu
 
             # .contiguous(): see _predict — required for torch.compile with possibly non-contiguous input.
             pred = self.network(patch[None].contiguous())[0].argmax(0).detach()
+            # Convert on the compute device before any transfer: fp16 is 4x smaller than the int64
+            # argmax output. For a CPU cache the synchronous D2H copy in the paste below doubles as
+            # the stream sync that makes reusing the pinned staging buffers safe.
+            pred = pred.to(dtype=cache_interactions.dtype)
             paste_tensor(
-                cache_interactions,
-                pred.to(cache_interactions.device, dtype=cache_interactions.dtype),
-                local_bbox,
-                channel_idx=prev_seg_channel,
+                cache_interactions, pred.to(cache_interactions.device), local_bbox, channel_idx=prev_seg_channel
             )
             del image_patch, interactions_patch, patch
             del pred
