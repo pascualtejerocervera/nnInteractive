@@ -28,7 +28,10 @@ Concurrency model:
   - A single global ``gpu_lock`` serializes the predict-capable endpoints
     (``add_*_interaction``) across *all* sessions, because the GPU is one
     resource. Two clients can preprocess images concurrently but only one
-    prediction runs at a time.
+    prediction runs at a time. The gpu lock is held only for the GPU-bound
+    interaction/prediction itself; building the response (bbox copy + blosc2
+    compression, pure per-session CPU work) happens after it is released so it
+    never stalls other sessions' predictions (see _run_gpu_then_build_response).
   - The acquisition order is always (session lock → gpu lock) so there is no
     deadlock potential.
   - The endpoints that carry large payloads (``set_image`` and the mask
@@ -76,6 +79,7 @@ from nnInteractive.inference.remote._protocol import (
     PATH_HEALTHZ,
     PATH_HEARTBEAT,
     PATH_LEASE_STATUS,
+    PATH_PREDICT,
     PATH_RELEASE,
     PATH_RESET_INTERACTIONS,
     PATH_SET_DO_AUTOZOOM,
@@ -130,6 +134,13 @@ class SessionEntry:
         not block reaping or shutdown.
         """
         try:
+            # set_image returns before preprocessing finishes, so it may still be running in the
+            # session's background thread; wait for it so _reset_session doesn't race the worker
+            # (which would resurrect the tensors we are about to free / submit after shutdown).
+            self.session._finish_preprocessing_and_initialize_interactions()
+        except Exception:
+            logger.exception("error draining preprocessing in SessionEntry.close()")
+        try:
             self.session._reset_session()
         except Exception:
             logger.exception("error during session._reset_session() in SessionEntry.close()")
@@ -164,6 +175,7 @@ class SessionRegistry:
         use_torch_compile: bool,
         interactions_storage: str,
         verbose: bool,
+        enable_undo: bool,
     ) -> None:
         self._artifacts = artifacts
         self._max_sessions = int(max_sessions)
@@ -175,6 +187,9 @@ class SessionRegistry:
         self._use_torch_compile = use_torch_compile
         self._interactions_storage = interactions_storage
         self._verbose = verbose
+        # Server-wide undo policy, decided once at startup (--no-undo). Every session is created
+        # with this value; clients have no say. When False, no session takes undo snapshots.
+        self._enable_undo = bool(enable_undo)
         self._entries: dict[str, SessionEntry] = {}
         self._mu = threading.Lock()
 
@@ -203,6 +218,7 @@ class SessionRegistry:
                 torch_n_threads=self._torch_n_threads,
                 do_autozoom=self._do_autozoom,
                 interactions_storage=self._interactions_storage,
+                enable_undo=self._enable_undo,
             )
             session.initialize_from_loaded_artifacts(self._artifacts)
             entry = SessionEntry(session)
@@ -308,6 +324,7 @@ def make_app(
     verbose: bool = False,
     api_key: Optional[str] = None,
     sweep_interval_seconds: float = 15.0,
+    enable_undo: bool = True,
 ) -> FastAPI:
     registry = SessionRegistry(
         artifacts=artifacts,
@@ -320,6 +337,7 @@ def make_app(
         use_torch_compile=use_torch_compile,
         interactions_storage=interactions_storage,
         verbose=verbose,
+        enable_undo=enable_undo,
     )
     gpu_lock = threading.Lock()
 
@@ -370,6 +388,7 @@ def make_app(
         torch_n_threads=torch_n_threads,
         do_autozoom=do_autozoom,
         interactions_storage=interactions_storage,
+        enable_undo=enable_undo,
     )
     _capability_session.initialize_from_loaded_artifacts(artifacts)
     _capability_snapshot = _build_capability_snapshot(_capability_session)
@@ -418,37 +437,25 @@ def make_app(
             return tb[slicer].detach().cpu().numpy()
         return np.ascontiguousarray(tb[slicer])
 
-    def _clip_bbox_to_buffer(session: nnInteractiveInferenceSession, bbox: list[list[int]]) -> list[list[int]]:
-        """Clip an inference-time bbox to the target buffer's spatial bounds.
-
-        The local session stores ``_last_paste_bbox`` in unclipped form: when
-        the prediction patch extends past an image edge (common with autozoom
-        + click near a boundary), bounds can be negative or exceed shape. We
-        clip so the bbox we slice with is valid and matches what was actually
-        pasted into the target buffer.
-        """
-        tb_shape = session.target_buffer.shape
-        return [[max(int(lb), 0), min(int(ub), int(tb_shape[i]))] for i, (lb, ub) in enumerate(bbox)]
+    def _empty_prediction_response(ran_prediction: bool) -> Response:
+        meta = {"ran_prediction": bool(ran_prediction), "bbox": None}
+        return Response(
+            content=b"",
+            media_type=CONTENT_TYPE_OCTET_STREAM,
+            headers={META_HEADER: json.dumps(meta, separators=(",", ":"))},
+        )
 
     def _build_prediction_response(session: nnInteractiveInferenceSession, ran_prediction: bool) -> Response:
-        bbox = session._last_paste_bbox if ran_prediction else None
-        if bbox is None or session.target_buffer is None:
-            meta = {"ran_prediction": bool(ran_prediction), "bbox": None}
-            return Response(
-                content=b"",
-                media_type=CONTENT_TYPE_OCTET_STREAM,
-                headers={META_HEADER: json.dumps(meta, separators=(",", ":"))},
-            )
-        clipped = _clip_bbox_to_buffer(session, bbox)
+        # The session stores _last_paste_bbox unclipped (autozoom near an edge can push it
+        # out of bounds); _clipped_last_paste_bbox gives directly-sliceable indices.
+        clipped = session._clipped_last_paste_bbox() if ran_prediction else None
+        if clipped is None:
+            return _empty_prediction_response(ran_prediction)
+        # Reset so a subsequent call without a prediction can't accidentally re-send a stale region.
+        session._last_paste_bbox = None
         if any(lb >= ub for lb, ub in clipped):
             # Bbox lies entirely outside the buffer — nothing to send.
-            session._last_paste_bbox = None
-            meta = {"ran_prediction": True, "bbox": None}
-            return Response(
-                content=b"",
-                media_type=CONTENT_TYPE_OCTET_STREAM,
-                headers={META_HEADER: json.dumps(meta, separators=(",", ":"))},
-            )
+            return _empty_prediction_response(True)
         sub = _read_target_bbox(session, clipped)
         meta = {
             "ran_prediction": True,
@@ -456,8 +463,6 @@ def make_app(
             "dtype": str(sub.dtype),
             "shape": list(sub.shape),
         }
-        # Reset so a subsequent call without a prediction can't accidentally re-send a stale region.
-        session._last_paste_bbox = None
         return Response(
             # Segmentations compress best with NOFILTER; skip auto-selection.
             content=pack_array(
@@ -519,18 +524,23 @@ def make_app(
             except (ValueError, AssertionError) as e:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e))
 
-    def _under_session_and_gpu_lock(entry: SessionEntry, fn):
-        """Run ``fn(session)`` under session lock + global GPU lock. Acquisition order
+    def _run_gpu_then_build_response(entry: SessionEntry, gpu_fn) -> Response:
+        """Run ``gpu_fn(session)`` (the GPU-bound interaction/prediction; returns
+        ``ran_prediction``) under session lock + global GPU lock, then build the prediction
+        response *after releasing the GPU lock* (still under the session lock): the response
+        is pure per-session CPU work (bbox copy + blosc2 compression, potentially 100s of ms
+        for large regions) and must not stall other sessions' predictions. Acquisition order
         is always session-then-gpu to avoid deadlocks.
 
         Like ``_under_session_lock``, this marks real user activity."""
         entry.mark_active()
         with entry.lock:
-            with gpu_lock:
-                try:
-                    return fn(entry.session)
-                except (ValueError, AssertionError) as e:
-                    raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e))
+            try:
+                with gpu_lock:
+                    ran_prediction = gpu_fn(entry.session)
+                return _build_prediction_response(entry.session, ran_prediction=ran_prediction)
+            except (ValueError, AssertionError) as e:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     # ----------------------------- routes --------------------------------- #
 
@@ -571,7 +581,8 @@ def make_app(
 
     @app.post(PATH_HEARTBEAT, dependencies=[auth])
     def heartbeat(entry: SessionEntry = lease) -> dict:
-        # require_lease already touched last_active_at.
+        # require_lease already refreshed the liveness clock (mark_seen); heartbeats
+        # deliberately do NOT touch last_active_at (the idle timeout).
         return {"remaining_seconds": registry.remaining_seconds(entry)}
 
     @app.get(PATH_LEASE_STATUS, dependencies=[auth])
@@ -596,10 +607,13 @@ def make_app(
             image = unpack_array(body)
 
             def _do(session):
+                # set_image kicks off preprocessing in the session's background thread and sets
+                # original_image_shape synchronously, so we can respond right away: preprocessing
+                # then overlaps with the client's follow-up round trips (set_target_buffer, first
+                # prompt placement). Every interaction endpoint blocks on the preprocessing future
+                # before touching the image, so a preprocessing error (e.g. an all-zero image)
+                # surfaces as a 400 on the first interaction call instead of here.
                 session.set_image(image, image_properties)
-                # set_image preprocesses in a background thread; force completion
-                # so subsequent calls can safely use original_image_shape.
-                session._finish_preprocessing_and_initialize_interactions()
                 return {"original_image_shape": list(session.original_image_shape)}
 
             return _under_session_lock(entry, _do)
@@ -644,35 +658,47 @@ def make_app(
 
         return _under_session_lock(entry, _do)
 
+    @app.post(PATH_PREDICT, dependencies=[auth])
+    def predict(payload: dict, entry: SessionEntry = lease) -> Response:
+        # Run prediction on the interactions accumulated so far (added with
+        # run_prediction=False). Returns nothing changed when nothing is queued.
+        force_full_refine = bool(payload.get("force_full_refine", False))
+
+        def _gpu(session):
+            bbox = session._predict(force_full_refine=force_full_refine)
+            return bbox is not None
+
+        return _run_gpu_then_build_response(entry, _gpu)
+
     @app.post(PATH_ADD_BBOX, dependencies=[auth])
     def add_bbox_interaction(payload: dict, entry: SessionEntry = lease) -> Response:
         run_prediction = bool(payload.get("run_prediction", True))
 
-        def _do(session):
+        def _gpu(session):
             session.add_bbox_interaction(
                 bbox_coords=[list(b) for b in payload["bbox_coords"]],
                 include_interaction=bool(payload["include_interaction"]),
                 run_prediction=run_prediction,
                 override_capability_checks=bool(payload.get("override_capability_checks", False)),
             )
-            return _build_prediction_response(session, run_prediction)
+            return run_prediction
 
-        return _under_session_and_gpu_lock(entry, _do)
+        return _run_gpu_then_build_response(entry, _gpu)
 
     @app.post(PATH_ADD_POINT, dependencies=[auth])
     def add_point_interaction(payload: dict, entry: SessionEntry = lease) -> Response:
         run_prediction = bool(payload.get("run_prediction", True))
 
-        def _do(session):
+        def _gpu(session):
             session.add_point_interaction(
                 coordinates=list(payload["coordinates"]),
                 include_interaction=bool(payload["include_interaction"]),
                 run_prediction=run_prediction,
                 override_capability_checks=bool(payload.get("override_capability_checks", False)),
             )
-            return _build_prediction_response(session, run_prediction)
+            return run_prediction
 
-        return _under_session_and_gpu_lock(entry, _do)
+        return _run_gpu_then_build_response(entry, _gpu)
 
     @app.post(PATH_ADD_SCRIBBLE, dependencies=[auth])
     async def add_scribble_interaction(request: Request, entry: SessionEntry = lease) -> Response:
@@ -695,7 +721,7 @@ def make_app(
         def _work():
             mask = unpack_array(body)
 
-            def _do(session):
+            def _gpu(session):
                 method = session.add_scribble_interaction if kind == "scribble" else session.add_lasso_interaction
                 method(
                     mask,
@@ -704,9 +730,9 @@ def make_app(
                     override_capability_checks=bool(meta.get("override_capability_checks", False)),
                     interaction_bbox=interaction_bbox,
                 )
-                return _build_prediction_response(session, run_prediction)
+                return run_prediction
 
-            return _under_session_and_gpu_lock(entry, _do)
+            return _run_gpu_then_build_response(entry, _gpu)
 
         return await run_in_threadpool(_work)
 
@@ -721,15 +747,15 @@ def make_app(
         def _work():
             initial_seg = unpack_array(body)
 
-            def _do(session):
+            def _gpu(session):
                 session.add_initial_seg_interaction(
                     initial_seg=initial_seg,
                     run_prediction=run_prediction,
                     override_capability_checks=bool(meta.get("override_capability_checks", False)),
                 )
-                return _build_prediction_response(session, run_prediction)
+                return run_prediction
 
-            return _under_session_and_gpu_lock(entry, _do)
+            return _run_gpu_then_build_response(entry, _gpu)
 
         return await run_in_threadpool(_work)
 
@@ -758,5 +784,6 @@ def _build_capability_snapshot(session: nnInteractiveInferenceSession) -> dict:
         "do_autozoom": bool(session.do_autozoom),
         "inference_session_version": session.INFERENCE_SESSION_VERSION,
         "license": session.license,
-        "supports_undo": True,
+        # Reflects the server-wide undo policy (--no-undo): whether undo is available on this server.
+        "supports_undo": bool(session.supports_undo),
     }

@@ -103,6 +103,7 @@ nninteractive-server \
 | `--torch-n-threads` | CPU threads for torch. Default: `8`. |
 | `--no-torch-compile` | Disable compiling the network with `torch.compile` (compile is **on by default**). With compile enabled the server runs a dummy warmup forward pass at startup to trigger the (slow) one-time compilation up front, so clients never see the first-prediction delay — startup just takes longer, every prediction is faster, and the cost is amortized across the long-lived process. Pass this flag to skip compilation (faster startup, or to work around a compile/backend issue). |
 | `--no-autozoom` | Disable adaptive zoom-out (rarely needed; on by default). |
+| `--no-undo` | Disable single-level undo for all sessions server-wide (on by default). Undo snapshots each session's interaction tensor and target buffer before every interaction, costing extra RAM per session plus some background CPU per prediction; pass this to skip that overhead when clients never undo. With this set, `/capabilities` reports `supports_undo: false` and the `/undo` endpoint always reports nothing to undo. Undo is a server-startup decision — there is no per-client toggle. |
 | `--max-sessions` | Maximum number of concurrent client sessions. Each holds its own image, target buffer, and interaction state; the network module (and therefore its weights) is shared by reference across all sessions — exactly one copy on the GPU regardless of session count. Predictions stay GPU-serialized across sessions. Default: `1` (single-tenant — same behavior as before). |
 | `--idle-timeout-seconds` | Inactivity timeout in seconds after which a session is reaped and its slot freed. Refreshed only by real user actions (`set_image`, `add_*_interaction`, …) — *not* by heartbeats — so a connected-but-idle client is still reaped here. Default: `600` (10 min). |
 | `--liveness-timeout-seconds` | Liveness timeout in seconds: a session is reaped if the server sees *no request at all* (not even a heartbeat) from the client for this long. This is how a crashed or disconnected client's slot is reclaimed quickly. The client heartbeats automatically at half this interval. Keep it well below `--idle-timeout-seconds`. Default: `60`. |
@@ -166,6 +167,10 @@ session. Under the hood, the server returns just the bbox region it touched
 (blosc2-compressed), and the client writes that into your buffer — typical
 binary masks compress to a tiny fraction of their raw size, so this stays
 fast even on slow links.
+
+Whether undo is available is a server-startup decision (`--no-undo`); when the
+server disables it, `session.supports_undo` is `False` and `session.undo()`
+returns `False`. There is no per-client undo toggle.
 
 ### Timeouts
 

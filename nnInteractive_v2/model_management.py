@@ -211,11 +211,13 @@ def get_local_model_dir(model_id: str, model_root: Optional[Path] = None) -> Pat
     return _models_dir(model_root) / model_id
 
 
-def ensure_model_available(model_id: str, model_root: Optional[Path] = None) -> Path:
+def ensure_model_available(model_id: str, model_root: Optional[Path] = None, manifest: Optional[dict] = None) -> Path:
     """Make ``model_id`` available locally and return its directory.
 
     Reuses an already-downloaded model without re-downloading. If the model is
     missing and the download fails (e.g. offline), raises a clear error.
+    ``manifest`` lets callers that already loaded the manifest (e.g. via
+    ``get_default_model_id``) skip a second remote fetch.
     """
     model_root = model_root or get_model_root_dir()
     local_model_dir = _models_dir(model_root) / model_id
@@ -225,7 +227,7 @@ def ensure_model_available(model_id: str, model_root: Optional[Path] = None) -> 
     if is_model_downloaded(model_id, model_root):
         return local_model_dir
 
-    manifest = load_model_manifest(model_root)
+    manifest = manifest or load_model_manifest(model_root)
     entry = _find_entry(manifest, model_id)
     if entry is None:
         available = [e["id"] for e in manifest["models"]]

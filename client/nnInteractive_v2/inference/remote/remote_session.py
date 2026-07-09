@@ -40,6 +40,7 @@ from nnInteractive_v2.inference.remote._protocol import (
     PATH_HEALTHZ,
     PATH_HEARTBEAT,
     PATH_LEASE_STATUS,
+    PATH_PREDICT,
     PATH_RELEASE,
     PATH_RESET_INTERACTIONS,
     PATH_SET_DO_AUTOZOOM,
@@ -142,17 +143,23 @@ class nnInteractiveRemoteInferenceSession:
         expiry: ``httpx.ReadTimeout``.
     set_image_read_timeout:
         Read timeout (seconds) used *only* for ``set_image``. After the volume
-        is uploaded, the server decompresses and preprocesses the full image
-        before responding, which can take far longer than a prediction on a
-        large volume. ``set_image`` therefore gets its own generous read
-        timeout instead of the much tighter ``read_timeout`` used for
-        predictions. On expiry: ``httpx.ReadTimeout``.
+        is uploaded, the server decompresses the full image before responding
+        (current servers then respond immediately and preprocess in the
+        background; older servers block on the full preprocessing too), which
+        can take far longer than a prediction on a large volume. ``set_image``
+        therefore gets its own generous read timeout instead of the much
+        tighter ``read_timeout`` used for predictions. On expiry:
+        ``httpx.ReadTimeout``.
     write_timeout:
         Seconds to finish uploading the request body. ``set_image`` uploads
         the full 4D volume so this is the longest-running upload. On expiry:
         ``httpx.WriteTimeout``.
     pool_timeout:
         Seconds to wait for an httpx connection from the pool.
+
+    Undo availability is decided by the server at startup (``--no-undo``): when
+    the server disables it, ``supports_undo`` reports ``False`` and ``undo()``
+    returns ``False``. There is no per-client undo toggle.
     """
 
     def __init__(
@@ -184,7 +191,8 @@ class nnInteractiveRemoteInferenceSession:
         )
         # Per-request timeout override for set_image: same connect/write/pool as
         # the client default, but a much longer read budget for server-side
-        # decompression + preprocessing of the full volume.
+        # decompression of the full volume (and, on older servers, its full
+        # preprocessing too — current servers preprocess in the background).
         self._set_image_timeout = httpx.Timeout(
             connect=connect_timeout,
             read=set_image_read_timeout,
@@ -233,7 +241,8 @@ class nnInteractiveRemoteInferenceSession:
         # "!!MISSING!!" means the server could not determine the license.
         self.license: Optional[str] = caps.get("license")
         # Older servers predate the /undo endpoint and omit this flag; default False so the
-        # GUI can disable undo instead of issuing requests that would 404.
+        # GUI can disable undo instead of issuing requests that would 404. Also False when the
+        # server was started with --no-undo (undo disabled server-wide).
         self.supports_undo: bool = bool(caps.get("supports_undo", False))
 
         self.original_image_shape: Optional[Tuple[int, ...]] = None
@@ -388,6 +397,17 @@ class nnInteractiveRemoteInferenceSession:
         nothing to undo (mirrors the local session's undo())."""
         resp = self._post_json(PATH_UNDO, {})
         return self._apply_prediction_response(resp)
+
+    def _predict(self, force_full_refine: bool = False) -> Optional[List[List[int]]]:
+        """Run prediction on the accumulated interactions without adding a new one.
+
+        Mirrors the local session's ``_predict`` so callers can trigger a manual
+        prediction (e.g. after adding prompts with ``run_prediction=False``). Patches
+        the local target buffer with the changed region and returns its bbox, or
+        None when nothing was queued to predict."""
+        resp = self._post_json(PATH_PREDICT, {"force_full_refine": bool(force_full_refine)})
+        ran = self._apply_prediction_response(resp)
+        return self._last_paste_bbox if ran else None
 
     def add_bbox_interaction(
         self,
@@ -546,9 +566,7 @@ class nnInteractiveRemoteInferenceSession:
         You normally never call this yourself: the session auto-heartbeats from
         a background thread for the lifetime of the object.
         """
-        resp = self._http.post(PATH_HEARTBEAT)
-        _raise_for_lease_errors(resp)
-        resp.raise_for_status()
+        resp = self._post_json(PATH_HEARTBEAT, {})
         return float(resp.json().get("remaining_seconds", 0.0))
 
     def _heartbeat_loop(self) -> None:
@@ -579,10 +597,7 @@ class nnInteractiveRemoteInferenceSession:
         Does NOT extend the lease — use ``heartbeat()`` for that. Raises
         :class:`SessionExpiredError` if the lease is already gone.
         """
-        resp = self._http.get(PATH_LEASE_STATUS)
-        _raise_for_lease_errors(resp)
-        resp.raise_for_status()
-        return resp.json()
+        return self._get_json(PATH_LEASE_STATUS)
 
     def close(self) -> None:
         # Stop the heartbeat thread first so it can't use self._http after we

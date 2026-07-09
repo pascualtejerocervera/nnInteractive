@@ -1,43 +1,12 @@
 import os
 import yaml
 import argparse
-from typing import List, Tuple
 import numpy as np
 from supervoxel import SuperVoxelGenerator
 from metadata import generate_fg_locations
 from tqdm import tqdm
 import torch
 import gc
-
-
-def list_and_clear_tensors_on_gpu():
-
-    gpu_tensors = []  # Collect GPU tensors to analyze them
-    tensor_sizes = []  # Collect tensor sizes to analyze them
-
-    for obj in gc.get_objects():
-        try:
-            if torch.is_tensor(obj) and obj.is_cuda:
-                print(f"Tensor: {type(obj)}, size: {obj.size()}, device: {obj.device}")
-                gpu_tensors.append(obj)
-                tensor_sizes.append(obj.nbytes)
-        except Exception as e:
-            pass  # Handle any inspection errors
-
-    # Delete all tensors found
-    print(f"Found {len(gpu_tensors)} tensors on GPU.")
-    bytes_sum = sum(tensor_sizes)
-    print(f"Total size: {bytes_sum / 1024 ** 3} GB")
-    for tensor in gpu_tensors:
-        del tensor  # Remove local references to the tensors
-
-    # Trigger garbage collection
-    gc.collect()
-
-    # Empty CUDA cache
-    torch.cuda.empty_cache()
-
-    print("Cleared GPU tensors and memory.")
 
 
 def run(input_folder: str, output_folder: str, config: str):
@@ -51,7 +20,7 @@ def run(input_folder: str, output_folder: str, config: str):
         output_folder = os.path.join(input_folder, os.pardir, "supervoxel")
     os.makedirs(output_folder, exist_ok=True)
 
-    # Load congiguration file
+    # Load configuration file
     with open(config, "r") as file:
         config = yaml.safe_load(file)
 
@@ -73,7 +42,7 @@ def run(input_folder: str, output_folder: str, config: str):
 
         if len(image_data.shape) == 4:
             image_data = image_data[0]
-            # chatch OOM error
+            # catch OOM error
         try:
             out_img = None
             out_img = gen.sam_supervoxel(image_data)

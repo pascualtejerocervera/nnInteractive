@@ -1,5 +1,3 @@
-from time import time
-from time import time
 from typing import List, Union, Tuple
 
 import numpy as np
@@ -26,8 +24,7 @@ def generate_bounding_boxes(
     - current_depth: Current recursion depth (used internally)
 
     Returns:
-    - List of tuples [(min_coords, max_coords), ...], where min_coords and max_coords are lists [x, y, z] defining each box
-      as a half-open interval [min_coords, max_coords).
+    - List of bboxes [[x1, x2], [y1, y2], [z1, z2]], each a half-open interval [lower, upper) per dimension.
     """
     if not torch.any(mask):
         return []
@@ -62,13 +59,20 @@ def generate_bounding_boxes(
     # print('stride', stride)
     # print('bbox', [[i, j] for i, j in zip(min_coords, max_coords)])
 
-    # Step 3: Generate potential centers within the object's bounding box
-    potential_centers = []
-    for x in range(max(0, min_coords[0].item()), min(mask.shape[0], max_coords[0].item() + 1), stride[0]):
-        for y in range(max(0, min_coords[1].item()), min(mask.shape[1], max_coords[1].item() + 1), stride[1]):
-            for z in range(max(0, min_coords[2].item()), min(mask.shape[2], max_coords[2].item() + 1), stride[2]):
-                if mask[x, y, z]:
-                    potential_centers.append([x, y, z])
+    # Step 3: Generate potential centers within the object's bounding box. Vectorized: the old
+    # triple Python loop probed mask[x, y, z] one element at a time — one GPU sync per probe on
+    # a CUDA mask. One advanced-indexing call keeps the same lexicographic candidate order.
+    axis_ranges = [
+        torch.arange(
+            max(0, min_coords[d].item()),
+            min(mask.shape[d], max_coords[d].item() + 1),
+            stride[d],
+            device=mask.device,
+        )
+        for d in range(3)
+    ]
+    grid = torch.cartesian_prod(*axis_ranges)  # (N, 3)
+    potential_centers = grid[mask[grid[:, 0], grid[:, 1], grid[:, 2]] != 0]
     # print(f'got {len(potential_centers)} center candidates')
 
     if len(potential_centers) == 0:
@@ -76,42 +80,45 @@ def generate_bounding_boxes(
             mask, bbox_size, [max(1, s // 2) for s in stride], margin, max_depth, current_depth + 1
         )
 
-    potential_centers = torch.tensor(potential_centers, device=mask.device)
-
     # Step 4: Greedy set cover algorithm
     uncovered = mask.clone().byte()  # Use byte tensor for efficiency
+
     bboxes = []
 
     while len(potential_centers) > 0 and uncovered.any():
-        best_center = None
-        best_covered = 0
-        best_bounds = None
-
-        # Find the center that covers the most uncovered voxels
-        idx = 0
-        while idx < len(potential_centers):
-            center = potential_centers[idx]
-            c_x, c_y, c_z = center
+        # Pull the candidate coordinates to the host once, queue every candidate's coverage sum,
+        # then fetch them all with a single host sync. The old loop paid several GPU syncs per
+        # candidate per round (Python max()/min() on 0-dim tensors plus .item() on each sum).
+        centers_list = potential_centers.tolist()
+        bounds = []
+        cover_sums = []
+        for c_x, c_y, c_z in centers_list:
             x_start = max(0, c_x - half_size[0] + margin[0])
             x_end = min(mask.shape[0], c_x + end_offset[0] - margin[0])  # Use end_offset for odd sizes
             y_start = max(0, c_y - half_size[1] + margin[1])
             y_end = min(mask.shape[1], c_y + end_offset[1] - margin[1])
             z_start = max(0, c_z - half_size[2] + margin[2])
             z_end = min(mask.shape[2], c_z + end_offset[2] - margin[2])
+            bounds.append((x_start, x_end, y_start, y_end, z_start, z_end))
+            cover_sums.append(uncovered[x_start:x_end, y_start:y_end, z_start:z_end].sum())
+        covered = torch.stack(cover_sums).tolist()  # one host sync for all candidates
 
-            num_covered = uncovered[x_start:x_end, y_start:y_end, z_start:z_end].sum().item()
+        # Find the center that covers the most uncovered voxels (first max wins, like before)
+        best_center = None
+        best_covered = 0
+        best_bounds = None
+        for idx, num_covered in enumerate(covered):
             if num_covered > best_covered:
                 best_covered = num_covered
                 best_center = idx
-                best_bounds = (x_start, x_end, y_start, y_end, z_start, z_end)
-            idx += 1
+                best_bounds = bounds[idx]
 
         # If no new voxels are covered, stop
         if best_covered == 0:
             break
 
         # Add the best bounding box
-        c_x, c_y, c_z = [i.item() for i in potential_centers[best_center]]
+        c_x, c_y, c_z = centers_list[best_center]
         bboxes.append(
             [
                 [c_x - half_size[0], c_x + end_offset[0]],
@@ -131,16 +138,9 @@ def generate_bounding_boxes(
         # Remove the used center from potential_centers
         potential_centers = potential_centers[uncovered[tuple(potential_centers.T)] > 0]
 
-    # Step 5: Recursively cover remaining voxels using uncovered as the mask
+    # Step 5: Cover remaining voxels via random sampling
     if uncovered.any():
-        if True:  # uncovered.sum() < np.prod([i // 3 for i in bbox_size]):
-            # print('random fallback')
-            bboxes.extend(random_sampling_fallback(uncovered, bbox_size, margin, 10))
-        else:
-            remaining_bboxes = generate_bounding_boxes(
-                uncovered, bbox_size, [max(1, s // 2) for s in stride], margin, max_depth, current_depth + 1
-            )
-            bboxes.extend(remaining_bboxes)
+        bboxes.extend(random_sampling_fallback(uncovered, bbox_size, margin, 10))
 
     return bboxes
 
@@ -195,23 +195,3 @@ def random_sampling_fallback(mask: torch.Tensor, bbox_size=(192, 192, 192), marg
             z_s:z_e,
         ] = 0
     return bboxes
-
-
-if __name__ == "__main__":
-    times = []
-    torch.set_num_threads(8)
-    for _ in range(1):
-        st = time()
-        mask = torch.zeros((256, 256, 256), dtype=torch.uint8, device=0)
-        mask[50:150, 50:150, 50:150] = 1  # A cubic object
-
-        # Generate bounding boxes with an odd size to test
-        bboxes = random_sampling_fallback(
-            mask, bbox_size=(193, 193, 193), stride="auto", margin=(10, 10, 10)  # Odd size
-        )
-
-        # Print results
-        print(f"Number of bounding boxes: {len(bboxes)}")
-        end = time()
-        times.append(end - st)
-    print(times)

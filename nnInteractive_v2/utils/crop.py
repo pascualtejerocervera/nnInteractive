@@ -1,4 +1,4 @@
-from typing import Sequence, Optional
+from typing import Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -102,50 +102,14 @@ def paste_tensor(target, source, bbox, channel_idx=None):
     if channel_idx is not None and isinstance(target, torch.Tensor):
         return paste_tensor(target[channel_idx], source, bbox)
 
-    if channel_idx is not None:
-        # target is a 4D blosc2 NDArray; write to target[channel_idx] at bbox.
-        target_shape = target.shape[1:]  # spatial dims
-
-        target_indices = []
-        source_indices = []
-
-        for i, (b0, b1) in enumerate(bbox):
-            t_start = max(b0, 0)
-            t_end = min(b1, target_shape[i])
-            if t_start >= t_end:
-                return  # no overlap in this dimension
-            s_start = t_start - b0
-            s_end = s_start + (t_end - t_start)
-            target_indices.append((t_start, t_end))
-            source_indices.append((s_start, s_end))
-
-        src = source[
-            source_indices[0][0] : source_indices[0][1],
-            source_indices[1][0] : source_indices[1][1],
-            source_indices[2][0] : source_indices[2][1],
-        ]
-        if isinstance(src, torch.Tensor):
-            src = src.cpu().numpy().astype(np.float16)
-        else:
-            src = np.asarray(src).astype(np.float16)
-
-        target[
-            (
-                channel_idx,
-                slice(target_indices[0][0], target_indices[0][1]),
-                slice(target_indices[1][0], target_indices[1][1]),
-                slice(target_indices[2][0], target_indices[2][1]),
-            )
-        ] = src
-        return
-
-    target_shape = target.shape  # (T0, T1, T2)
+    # Spatial extent of the paste target (skip the channel dim of a 4D blosc2 target).
+    target_shape = target.shape[1:] if channel_idx is not None else target.shape
 
     # For each dimension compute:
     #   - The valid region in the target: [t_start, t_end)
     #   - The corresponding region in the source: [s_start, s_end)
-    target_indices = []
-    source_indices = []
+    target_slices = []
+    source_slices = []
 
     for i, (b0, b1) in enumerate(bbox):
         # Determine valid region in target tensor:
@@ -160,32 +124,24 @@ def paste_tensor(target, source, bbox, channel_idx=None):
         s_start = t_start - b0
         s_end = s_start + (t_end - t_start)
 
-        target_indices.append((t_start, t_end))
-        source_indices.append((s_start, s_end))
+        target_slices.append(slice(t_start, t_end))
+        source_slices.append(slice(s_start, s_end))
 
-    # Paste the corresponding region from source into target.
-    if isinstance(target, torch.Tensor):
-        target[
-            target_indices[0][0] : target_indices[0][1],
-            target_indices[1][0] : target_indices[1][1],
-            target_indices[2][0] : target_indices[2][1],
-        ] = source[
-            source_indices[0][0] : source_indices[0][1],
-            source_indices[1][0] : source_indices[1][1],
-            source_indices[2][0] : source_indices[2][1],
-        ].to(
-            target.device
-        )
+    target_slices = tuple(target_slices)
+    source_slices = tuple(source_slices)
+
+    if channel_idx is not None:
+        # 4D blosc2 NDArray target: numpy read-modify-write on the selected channel. blosc2's
+        # setitem needs a C-contiguous array of the target's dtype; ascontiguousarray converts
+        # dtype/layout in one pass and skips the copy when both already match.
+        src = source[source_slices]
+        if isinstance(src, torch.Tensor):
+            src = src.cpu().numpy()
+        target[(channel_idx, *target_slices)] = np.ascontiguousarray(src, dtype=target.dtype)
+    elif isinstance(target, torch.Tensor):
+        target[target_slices] = source[source_slices].to(target.device)
     else:
-        target[
-            target_indices[0][0] : target_indices[0][1],
-            target_indices[1][0] : target_indices[1][1],
-            target_indices[2][0] : target_indices[2][1],
-        ] = source[
-            source_indices[0][0] : source_indices[0][1],
-            source_indices[1][0] : source_indices[1][1],
-            source_indices[2][0] : source_indices[2][1],
-        ].cpu()
+        target[target_slices] = source[source_slices].cpu()
 
     return target
 

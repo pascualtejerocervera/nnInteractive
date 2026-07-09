@@ -33,16 +33,14 @@ def iterative_3x3_same_padding_pool3d(x, kernel_size: int, use_min_pool: bool = 
     x = F.pad(x, (pad_front, pad_back, pad_front, pad_back, pad_front, pad_back), mode="replicate")
 
     iters = (kernel_size - 1) // 2
-    # Apply max pooling with no additional padding.
-    if not use_min_pool:
-        for _ in range(iters):
-            x = F.max_pool3d(x, kernel_size=3, stride=1, padding=0)
-        empty_cache(x.device)
-        cudnn.benchmark = benchmark
-        return x
-    else:
-        for _ in range(iters):
-            x = -F.max_pool3d(-x, kernel_size=3, stride=1, padding=0)
-        empty_cache(x.device)
-        cudnn.benchmark = benchmark
-        return x
+    # Apply max pooling with no additional padding. Min pooling is max pooling on the negated
+    # input (negate once before and after; the per-iteration double negations cancel out).
+    if use_min_pool:
+        x = -x
+    for _ in range(iters):
+        x = F.max_pool3d(x, kernel_size=3, stride=1, padding=0)
+    if use_min_pool:
+        x = -x
+    empty_cache(x.device)
+    cudnn.benchmark = benchmark
+    return x

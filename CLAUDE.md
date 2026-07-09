@@ -69,7 +69,7 @@ How the shared namespace works:
 
 ### Core Class: `nnInteractiveInferenceSession` (`nnInteractive/inference/inference_session.py`)
 
-Session-based inference engine (~1040 lines) that manages state across multiple predictions. This is the main user-facing API.
+Session-based inference engine (~2000 lines) that manages state across multiple predictions. This is the main user-facing API.
 
 **Workflow**: `initialize_from_trained_model_folder()` → `set_image()` → `set_target_buffer()` → `add_*_interaction()` (repeatable)
 
@@ -119,7 +119,7 @@ A trained model folder must contain:
 A trained model folder may also contain:
 - `LICENSE` — the model's license. **Only the first non-empty line is read** and exposed as `session.license` (a short identifier, e.g. `CC BY-NC-SA 4.0`); any following lines (URL, full license text, …) are for human readers and are ignored. If the file is absent the loader falls back to the official-checkpoint heuristic (`_is_official_checkpoint` → `CC BY-NC-SA 4.0`), otherwise it reports `!!MISSING!!`. The license is printed on load and surfaced over the remote `/capabilities` endpoint so GUIs can display it.
 
-Official weights are hosted on HuggingFace at `MIC-DKFZ/nnInteractive`. The selectable models are enumerated by a root-level `models.json` manifest; discovery/download is handled by `nnInteractive/model_management.py` (`list_models`, `ensure_model_available`, `get_default_model_id`), which stores models under `$NNINTERACTIVE_MODEL_DIR` (default `~/.nninteractive`). The default model is currently `nnInteractive_v1.0`.
+Official weights are hosted on HuggingFace at `MIC-DKFZ/nnInteractive`. The selectable models are enumerated by a `models.json` manifest at the root of that HF repo (not of this git repo); discovery/download is handled by `nnInteractive/model_management.py` (`list_models`, `ensure_model_available`, `get_default_model_id`), which stores models under `$NNINTERACTIVE_MODEL_DIR` (default `~/.nninteractive`). The default model is currently `nnInteractive_v1.0`.
 
 ### Key Modules
 
@@ -134,13 +134,13 @@ Official weights are hosted on HuggingFace at `MIC-DKFZ/nnInteractive`. The sele
 
 ### Key Dependencies
 
-- **`nnunetv2`** (>=2.6): Provides network architecture, ConfigurationManager, PlansManager, preprocessing pipeline
-- **`torch`** (>=2.6, <2.9.0): PyTorch 2.9.0 is excluded due to OOM bugs with 3D convolutions
+- **`nnunetv2`** (>=2.7.0): Provides network architecture, ConfigurationManager, PlansManager, preprocessing pipeline
+- **`torch`** (>=2.1.2, !=2.9.*): PyTorch 2.9 is excluded due to OOM bugs with 3D convolutions
 - **`acvl-utils`** (>=0.2.3, <0.3): Spatial operations (cropping, padding)
 
 ### Coordinate System
 
-Images are 4D numpy arrays `[C, X, Y, Z]`. During preprocessing, images are cropped to their nonzero region (`bbox_used_for_cropping`). All interaction coordinates must be transformed between original and cropped space via `transform_coordinates_noresampling()`.
+Images are 4D numpy arrays `[C, X, Y, Z]`. Images are intentionally **not** cropped during preprocessing: interactions, predictions and the target buffer all live in the original image's coordinate space, so all `add_*_interaction()` coordinates are used as-is (the nonzero region is located only to compute normalization statistics).
 
 Bounding box coordinates use `[[x1, x2], [y1, y2], [z1, z2]]` half-open intervals throughout. Current pretrained models only support **2D bounding boxes** (one dimension must have size 1).
 
