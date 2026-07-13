@@ -1,6 +1,6 @@
 [project]
 name = "nninteractive_v2-client"
-version = "2.5.0"
+version = "2.5.1"
 requires-python = ">=3.10"
 description = "Lightweight, torch-free remote client for nnInteractive_v2 (nnInteractive_v2RemoteInferenceSession)"
 readme = "readme.md"

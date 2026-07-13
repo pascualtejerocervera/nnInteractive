@@ -1,6 +1,6 @@
 [project]
 name = "nnInteractive_v2"
-version = "2.5.0"
+version = "2.5.1"
 requires-python = ">=3.10"
 description = "Inference code for nnInteractive_v2"
 readme = "readme.md"
